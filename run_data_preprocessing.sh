@@ -25,7 +25,7 @@ else
         "${out_dir}/data_import.train.labels.csv.gz" \
         "${out_dir}/data_import.label_key.json.gz"
 
-  (cd "$repo_root" && python "datasets/data/prepare_datasets.py" \
+  (cd "$repo_root" && python "preprocessing/data_preprocessing.py" \
     --name "data_import" \
     --output_dir "$out_dir" \
     --data.raw "${repo_root}/datasets/data/covid" \

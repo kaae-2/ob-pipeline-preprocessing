@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-CLI utility to convert gzipped FCS data into gzipped CSV outputs with optional column relabeling.
+CLI utility to convert gzipped FCS data into gzipped CSV outputs and tar archives.
 
 Args:
     --data.raw      Path to a gz-compressed FCS file OR a directory of FCS files.
@@ -14,7 +14,9 @@ Args:
 
 import argparse
 import gzip
+import json
 import os
+import re
 import shutil
 import sys
 import tarfile
@@ -494,6 +496,64 @@ def map_labels_to_ints(
     return pd.Series(mapped, name="label")
 
 
+def _sanitize_sample_id(path: Path) -> str:
+    name = path.name
+    lowered = name.lower()
+    while lowered.endswith(".gz") or lowered.endswith(".fcs"):
+        if lowered.endswith(".gz"):
+            name = name[: -len(".gz")]
+            lowered = name.lower()
+        if lowered.endswith(".fcs"):
+            name = name[: -len(".fcs")]
+            lowered = name.lower()
+    name = re.sub(r"\s+", "_", name)
+    name = re.sub(r"[^A-Za-z0-9_.-]", "", name)
+    return name
+
+
+def write_gz_csv(df: pd.DataFrame, path: Path, header: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False, header=header, compression="gzip")
+
+
+def write_gz_series(s: pd.Series, path: Path, header: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    s.to_csv(path, index=False, header=header, compression="gzip")
+
+
+def _write_label_key(out_dir: Path, name: str, id_to_label: Dict[int, str]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"id_to_label": {str(k): v for k, v in id_to_label.items()}}
+    key_path = out_dir / f"{name}.label_key.json.gz"
+    with gzip.open(key_path, "wt") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def _write_test_archives(
+    out_dir: Path, name: str, test_samples: Dict[str, Tuple[pd.DataFrame, pd.Series]]
+) -> None:
+    matrices_path = out_dir / f"{name}.test.matrices.tar.gz"
+    labels_path = out_dir / f"{name}.test.labels.tar.gz"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        matrix_files: List[Path] = []
+        label_files: List[Path] = []
+        for sid, (features, labels) in test_samples.items():
+            matrix_file = Path(tmpdir) / f"{sid}.matrix.csv.gz"
+            label_file = Path(tmpdir) / f"{sid}.labels.csv.gz"
+            write_gz_csv(features, matrix_file)
+            write_gz_series(labels, label_file)
+            matrix_files.append(matrix_file)
+            label_files.append(label_file)
+
+        with tarfile.open(matrices_path, "w:gz") as tar:
+            for path in sorted(matrix_files, key=lambda p: p.name):
+                tar.add(path, arcname=path.name)
+
+        with tarfile.open(labels_path, "w:gz") as tar:
+            for path in sorted(label_files, key=lambda p: p.name):
+                tar.add(path, arcname=path.name)
+
+
 def label_samples_from_flowjo_workspace_by_sample(
     workspace_path: str, fcs_paths: Sequence[Path]
 ) -> Dict[str, Tuple[pd.DataFrame, pd.Series]]:
@@ -684,53 +744,75 @@ def main(argv: Iterable[str] = None):
     method = args.method
     test_sample_limit = args.test_sample_limit
 
-    if is_flowjo_workspace(label_path):
-        with (
-            prepared_fcs_inputs(raw_path) as ready_fcs,
-            workspace_materialized(label_path) as workspace_path,
-        ):
-            features_df, labels = label_samples_from_flowjo_workspace(
-                workspace_path, ready_fcs
-            )
-    else:
-        with prepared_fcs_inputs(raw_path) as ready_fcs:
-            if len(ready_fcs) != 1:
-                print(
-                    f"Warning: expected a single FCS input but found {len(ready_fcs)}; using the first file {ready_fcs[0]}.",
-                    file=sys.stderr,
+    out_dir = Path(output_dir)
+    per_sample: Dict[str, Tuple[pd.DataFrame, pd.Series]] = {}
+
+    with prepared_fcs_inputs(raw_path) as ready_fcs:
+        if not ready_fcs:
+            raise FileNotFoundError(f"No FCS inputs found at {raw_path}")
+
+        if label_path and is_flowjo_workspace(label_path):
+            with workspace_materialized(label_path) as workspace_path:
+                flowjo_samples = label_samples_from_flowjo_workspace_by_sample(
+                    workspace_path, ready_fcs
                 )
-            data_df = parse_fcs_to_dataframe(str(ready_fcs[0]))
-            data_df = apply_labels(label_path, data_df)
-            features_df, labels = split_features_and_labels(data_df)
+            for sample_id, (features, labels) in flowjo_samples.items():
+                per_sample[_sanitize_sample_id(Path(sample_id))] = (features, labels)
+        else:
+            for fcs_path in ready_fcs:
+                data_df = parse_fcs_to_dataframe(str(fcs_path))
+                if label_path:
+                    data_df = apply_labels(label_path, data_df)
+                features, labels = extract_labels_from_dataframe(data_df)
+                per_sample[_sanitize_sample_id(fcs_path)] = (features, labels)
 
-    os.makedirs(output_dir, exist_ok=True)
-    (train_features, train_labels), (test_features, test_labels) = split_train_test(
-        features_df,
-        labels,
-        method=method,
-        seed=seed,
-        test_sample_limit=test_sample_limit,
-    )
+    samples = sorted(per_sample.keys())
+    label_series = [labels for _, labels in per_sample.values()]
+    id_to_label = build_label_key(label_series)
 
-    # Test split keeps the legacy filenames for downstream compatibility.
-    test_data_output_path = os.path.join(output_dir, f"{name}.matrix.gz")
-    test_features.to_csv(test_data_output_path, index=False, compression="gzip")
-    if test_labels is not None:
-        test_label_output_path = os.path.join(output_dir, f"{name}.true_labels.gz")
-        test_labels.to_csv(
-            test_label_output_path, index=False, header=False, compression="gzip"
-        )
+    mapped_samples: Dict[str, Tuple[pd.DataFrame, pd.Series]] = {}
+    for sid, (features, labels) in per_sample.items():
+        mapped_samples[sid] = (features, map_labels_to_ints(labels, id_to_label))
 
-    # Training split uses the new suffixes.
-    train_data_output_path = os.path.join(output_dir, f"{name}.matrix.training.gz")
-    train_features.to_csv(train_data_output_path, index=False, compression="gzip")
-    if train_labels is not None:
-        train_label_output_path = os.path.join(
-            output_dir, f"{name}.true_labels.training.gz"
+    if len(samples) == 1:
+        feats, labs = mapped_samples[samples[0]]
+        (train_feats, train_labels), (test_feats, test_labels) = split_train_test(
+            feats, labs, method=method, seed=seed
         )
-        train_labels.to_csv(
-            train_label_output_path, index=False, header=False, compression="gzip"
-        )
+        if train_labels is None or test_labels is None:
+            raise ValueError("Expected labels for single-sample split.")
+
+        write_gz_csv(train_feats, out_dir / f"{name}.train.matrix.csv.gz")
+        write_gz_series(train_labels, out_dir / f"{name}.train.labels.csv.gz")
+        _write_test_archives(out_dir, name, {samples[0]: (test_feats, test_labels)})
+        _write_label_key(out_dir, name, id_to_label)
+        return
+
+    rng = np.random.default_rng(seed)
+    chosen_train = rng.choice(samples)
+
+    remaining = [sid for sid in samples if sid != chosen_train]
+    if test_sample_limit is not None:
+        if test_sample_limit <= 0:
+            raise ValueError("test-sample-limit must be a positive integer.")
+        if len(remaining) > test_sample_limit:
+            remaining = sorted(
+                rng.choice(remaining, size=test_sample_limit, replace=False)
+            )
+
+    test_samples: Dict[str, Tuple[pd.DataFrame, pd.Series]] = {}
+    for sid in remaining:
+        test_samples[sid] = mapped_samples[sid]
+
+    train_feats, train_labels = mapped_samples[chosen_train]
+    write_gz_csv(train_feats, out_dir / f"{name}.train.matrix.csv.gz")
+    write_gz_series(train_labels, out_dir / f"{name}.train.labels.csv.gz")
+
+    if not test_samples:
+        test_samples = {"empty": (pd.DataFrame(), pd.Series(dtype=int))}
+
+    _write_test_archives(out_dir, name, test_samples)
+    _write_label_key(out_dir, name, id_to_label)
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ rm -f "${out_dir}/data_import."*.matrix.gz \
   --output_dir "$out_dir" \
   --data.raw "${script_dir}/out/data/data_import/${dataset_name}.data.gz" \
   --data.order "${script_dir}/out/data/data_import/${dataset_name}.order.json.gz" \
+  --data.attachments "${script_dir}/out/data/data_import/${dataset_name}.attachments.gz" \
   --num 1 \
   --test-sample-limit 5)
 

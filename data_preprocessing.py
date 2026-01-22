@@ -4,11 +4,12 @@
 CLI utility to split CSV sample data into train/test tarballs using an explicit order.
 
 Args:
-    --data.raw      Path to a tar.gz archive (or directory) of CSV files.
-    --data.order    Path to JSON with {"order": [1, 2, ...]} (1-based sample indices).
-    --num           1-based index into data.order to pick the training sample.
-    --output_dir    Directory where the matrix/label archives will be written.
-    --name          Dataset name used for the output filenames.
+    --data.raw          Path to a tar.gz archive (or directory) of CSV files.
+    --data.order        Path to JSON with {"order": [1, 2, ...]} (1-based sample indices).
+    --data.attachments  Optional attachments archive (currently unused).
+    --num               1-based index into data.order to pick the training sample.
+    --output_dir        Directory where the matrix/label archives will be written.
+    --name              Dataset name used for the output filenames.
 """
 
 import argparse
@@ -870,6 +871,12 @@ def parse_args() -> argparse.ArgumentParser:
         help="JSON file containing an 'order' array of 1-based sample indices.",
     )
     parser.add_argument(
+        "--data.attachments",
+        type=str,
+        default=None,
+        help="Optional attachments archive (currently unused).",
+    )
+    parser.add_argument(
         "--num",
         type=int,
         required=True,
@@ -906,6 +913,13 @@ def main(argv: Optional[Sequence[str]] = None):
     name = args.name
     num = args.num
     test_sample_limit = args.test_sample_limit
+    attachments_path = getattr(args, "data.attachments")
+
+    if attachments_path:
+        print(
+            f"Warning: data attachments are unused ({attachments_path}).",
+            file=sys.stderr,
+        )
 
     out_dir = Path(output_dir)
     order = load_order(order_path)

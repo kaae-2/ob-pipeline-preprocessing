@@ -5,7 +5,7 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 out_dir="${script_dir}/out/data/data_import/preprocessing/data_preprocessing/default"
-dataset_name="FR-FCM-Z2KP_healthy_final"
+dataset_name="FR-FCM-Z2KP_virus_final"
 
 train_matrix="${out_dir}/data_import.train.matrix.tar.gz"
 train_labels="${out_dir}/data_import.train.labels.tar.gz"

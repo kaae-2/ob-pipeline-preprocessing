@@ -5,9 +5,10 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 out_dir="${script_dir}/out/data/data_import/preprocessing/data_preprocessing/default"
+dataset_name="FR-FCM-Z2KP_healthy_final"
 
-train_matrix="${out_dir}/data_import.train.matrix.csv.gz"
-train_labels="${out_dir}/data_import.train.labels.csv.gz"
+train_matrix="${out_dir}/data_import.train.matrix.tar.gz"
+train_labels="${out_dir}/data_import.train.labels.tar.gz"
 test_matrices="${out_dir}/data_import.test.matrices.tar.gz"
 test_labels="${out_dir}/data_import.test.labels.tar.gz"
 label_key="${out_dir}/data_import.label_key.json.gz"
@@ -21,28 +22,29 @@ else
         "${out_dir}/data_import.test.labels.csv.gz" \
         "${out_dir}/data_import.test.matrices.tar.gz" \
         "${out_dir}/data_import.test.labels.tar.gz" \
-        "${out_dir}/data_import.train.matrix.csv.gz" \
-        "${out_dir}/data_import.train.labels.csv.gz" \
+        "${out_dir}/data_import.train.matrix.tar.gz" \
+        "${out_dir}/data_import.train.labels.tar.gz" \
         "${out_dir}/data_import.label_key.json.gz"
 
   (cd "$repo_root" && python "preprocessing/data_preprocessing.py" \
     --name "data_import" \
     --output_dir "$out_dir" \
-    --data.raw "${repo_root}/datasets/data/covid" \
-    --data.labels "${repo_root}/datasets/attachments/01-May-2020_Human_COVID_analysis_template.wsp" \
+    --data.raw "${script_dir}/out/data/data_import/${dataset_name}.data.gz" \
+    --data.order "${script_dir}/out/data/data_import/${dataset_name}.order.json.gz" \
+    --num 1 \
     --test-sample-limit 5)
 fi
 
-# Create gz-suffixed symlinks where models/dgcytof expects them
+# Create tarball symlinks where models/dgcytof expects them
 repo_root="$(cd "$script_dir/.." && pwd)"
 src_dir="$out_dir"
 model_out_dir="${repo_root}/models/dgcytof/out/data/data_preprocessing/default"
 
 mkdir -p "$model_out_dir"
-ln -sf "${src_dir}/data_import.train.matrix.csv.gz" \
-      "${model_out_dir}/data_preprocessing.train.matrix.csv.gz"
-ln -sf "${src_dir}/data_import.train.labels.csv.gz" \
-      "${model_out_dir}/data_preprocessing.train.labels.csv.gz"
+ln -sf "${src_dir}/data_import.train.matrix.tar.gz" \
+      "${model_out_dir}/data_preprocessing.train.matrix.tar.gz"
+ln -sf "${src_dir}/data_import.train.labels.tar.gz" \
+      "${model_out_dir}/data_preprocessing.train.labels.tar.gz"
 ln -sf "${src_dir}/data_import.test.matrices.tar.gz" \
       "${model_out_dir}/data_preprocessing.test.matrices.tar.gz"
 ln -sf "${src_dir}/data_import.test.labels.tar.gz" \

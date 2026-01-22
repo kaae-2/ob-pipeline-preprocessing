@@ -1,15 +1,14 @@
 #!/usr/bin/env python
 
 """
-CLI utility to convert gzipped FCS data into gzipped CSV outputs and tar archives.
+CLI utility to split CSV sample data into train/test tarballs using an explicit order.
 
 Args:
-    --data.raw      Path to a gz-compressed FCS file OR a directory of FCS files.
-    --data.labels   Path to a gz-compressed labels file. Text replaces FCS headers; XML is not supported.
-    --output_dir    Directory where the matrix/label CSV files will be written.
+    --data.raw      Path to a tar.gz archive (or directory) of CSV files.
+    --data.order    Path to JSON with {"order": [1, 2, ...]} (1-based sample indices).
+    --num           1-based index into data.order to pick the training sample.
+    --output_dir    Directory where the matrix/label archives will be written.
     --name          Dataset name used for the output filenames.
-    --seed          Random seed used for deterministic train/test splits.
-    --method        Train/test split method (only 'default' is supported today).
 """
 
 import argparse
@@ -250,6 +249,74 @@ def prepared_fcs_inputs(raw_input: str) -> Iterable[List[Path]]:
     fcs_paths = collect_fcs_inputs(raw_input)
     with prepared_fcs_paths(fcs_paths) as ready:
         yield ready
+
+
+def collect_csv_inputs(raw_input: str) -> List[Path]:
+    """
+    Accept a single CSV path or a directory of CSV files and return a sorted list of paths.
+    """
+    path = Path(raw_input)
+    if path.is_dir():
+        candidates = sorted(
+            [p for p in path.iterdir() if p.suffix.lower() == ".csv"]
+            + [
+                p
+                for p in path.iterdir()
+                if tuple(s.lower() for s in p.suffixes[-2:]) == (".csv", ".gz")
+            ]
+        )
+        if not candidates:
+            raise FileNotFoundError(f"No CSV files found in directory: {raw_input}")
+        return candidates
+    if not path.exists():
+        raise FileNotFoundError(f"Raw data path does not exist: {raw_input}")
+    return [path]
+
+
+@contextmanager
+def extract_csv_from_tar(tar_path: Path) -> Iterable[List[Path]]:
+    """
+    Extract CSV files from a tar/tar.gz archive into a temporary directory and yield their paths.
+    """
+    tmp_dir = tempfile.TemporaryDirectory()
+    try:
+        with tarfile.open(tar_path, mode="r:*") as tar:
+            members = [
+                m
+                for m in tar.getmembers()
+                if m.name.lower().endswith(".csv") or m.name.lower().endswith(".csv.gz")
+            ]
+            if not members:
+                raise FileNotFoundError(f"No CSV files found in archive: {tar_path}")
+            extracted: List[Path] = []
+            for member in members:
+                tar.extract(member, path=tmp_dir.name, filter="data")
+                extracted.append(Path(tmp_dir.name) / member.name)
+        yield sorted(extracted, key=lambda p: p.name)
+    finally:
+        tmp_dir.cleanup()
+
+
+@contextmanager
+def prepared_csv_inputs(raw_input: str) -> Iterable[List[Path]]:
+    """
+    Load CSV inputs from a path that may be a single file, directory, or tar/tar.gz archive.
+    """
+    raw_path = Path(raw_input)
+    if raw_path.is_file() and is_tar_archive(raw_path):
+        with extract_csv_from_tar(raw_path) as extracted:
+            yield extracted
+        return
+
+    csv_paths = collect_csv_inputs(raw_input)
+    yield sorted(csv_paths, key=lambda p: p.name)
+
+
+def read_csv_dataframe(path: Path) -> pd.DataFrame:
+    """Read a CSV or gzipped CSV into a DataFrame."""
+    if path.suffix.lower() == ".gz" or path.name.lower().endswith(".csv.gz"):
+        return pd.read_csv(path, compression="gzip")
+    return pd.read_csv(path)
 
 
 def _flowjo_leaf_gate_paths(
@@ -521,6 +588,16 @@ def write_gz_series(s: pd.Series, path: Path, header: bool = False) -> None:
     s.to_csv(path, index=False, header=header, compression="gzip")
 
 
+def write_csv(df: pd.DataFrame, path: Path, header: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False, header=header)
+
+
+def write_series_csv(series: pd.Series, path: Path, header: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    series.to_csv(path, index=False, header=header)
+
+
 def _write_label_key(out_dir: Path, name: str, id_to_label: Dict[int, str]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {"id_to_label": {str(k): v for k, v in id_to_label.items()}}
@@ -552,6 +629,70 @@ def _write_test_archives(
         with tarfile.open(labels_path, "w:gz") as tar:
             for path in sorted(label_files, key=lambda p: p.name):
                 tar.add(path, arcname=path.name)
+
+
+def _write_sample_archives(
+    out_dir: Path,
+    name: str,
+    train_id: int,
+    test_ids: Sequence[int],
+    samples: Dict[int, Tuple[pd.DataFrame, pd.Series]],
+) -> None:
+    train_matrix_path = out_dir / f"{name}.train.matrix.tar.gz"
+    train_labels_path = out_dir / f"{name}.train.labels.tar.gz"
+    test_matrices_path = out_dir / f"{name}.test.matrices.tar.gz"
+    test_labels_path = out_dir / f"{name}.test.labels.tar.gz"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        train_features, train_labels = samples[train_id]
+        train_matrix_file = Path(tmpdir) / f"{name}-data-{train_id}.csv"
+        train_label_file = Path(tmpdir) / f"{name}-label-{train_id}.csv"
+        write_csv(train_features, train_matrix_file)
+        write_series_csv(train_labels, train_label_file)
+
+        with tarfile.open(train_matrix_path, "w:gz") as tar:
+            tar.add(train_matrix_file, arcname=train_matrix_file.name)
+
+        with tarfile.open(train_labels_path, "w:gz") as tar:
+            tar.add(train_label_file, arcname=train_label_file.name)
+
+        test_matrix_files: List[Path] = []
+        test_label_files: List[Path] = []
+        for test_id in test_ids:
+            features, labels = samples[test_id]
+            matrix_file = Path(tmpdir) / f"{name}-data-{test_id}.csv"
+            label_file = Path(tmpdir) / f"{name}-label-{test_id}.csv"
+            write_csv(features, matrix_file)
+            write_series_csv(labels, label_file)
+            test_matrix_files.append(matrix_file)
+            test_label_files.append(label_file)
+
+        with tarfile.open(test_matrices_path, "w:gz") as tar:
+            for path in test_matrix_files:
+                tar.add(path, arcname=path.name)
+
+        with tarfile.open(test_labels_path, "w:gz") as tar:
+            for path in test_label_files:
+                tar.add(path, arcname=path.name)
+
+
+def load_order(order_path: str) -> List[int]:
+    """Load the order list from a JSON file."""
+    try:
+        payload = json.loads(read_bytes_handling_gzip(order_path).decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse order JSON: {order_path}") from exc
+
+    if not isinstance(payload, dict) or "order" not in payload:
+        raise ValueError("Order JSON must be an object with an 'order' key.")
+    order = payload["order"]
+    if not isinstance(order, list) or not order:
+        raise ValueError("Order JSON must contain a non-empty list.")
+    if not all(isinstance(item, int) for item in order):
+        raise ValueError("Order entries must be integers.")
+    if len(set(order)) != len(order):
+        raise ValueError("Order entries must be unique.")
+    return order
 
 
 def label_samples_from_flowjo_workspace_by_sample(
@@ -685,133 +826,113 @@ def split_train_test(
 
 def parse_args() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Preprocess gzipped FCS data into CSV."
+        description="Preprocess CSV samples into train/test archives."
     )
     parser.add_argument(
         "--data.raw",
         type=str,
         required=True,
-        help="Gz-compressed FCS data file.",
+        help="Tar.gz archive or directory of CSV samples.",
     )
     parser.add_argument(
-        "--data.labels",
+        "--data.order",
         type=str,
         required=True,
-        help="Gz-compressed labels file. Text replaces FCS headers; XML is not supported.",
+        help="JSON file containing an 'order' array of 1-based sample indices.",
+    )
+    parser.add_argument(
+        "--num",
+        type=int,
+        required=True,
+        help="1-based index into data.order for the training sample.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         required=True,
-        help="Directory to write the resulting CSV file.",
+        help="Directory to write the resulting archives.",
     )
     parser.add_argument(
         "--name",
         type=str,
         default="dataset",
-        help="Dataset name used for output filename.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed used for deterministic train/test splits.",
-    )
-    parser.add_argument(
-        "--method",
-        type=str,
-        default="default",
-        help="Train/test split method. Only 'default' is supported.",
+        help="Dataset name used for output filenames.",
     )
     parser.add_argument(
         "--test-sample-limit",
         type=int,
         default=None,
-        help="Limit number of test samples (random subset).",
+        help="Limit number of test samples (order-based).",
     )
     return parser
 
 
-def main(argv: Iterable[str] = None):
+def main(argv: Optional[Sequence[str]] = None):
     parser = parse_args()
     args = parser.parse_args(argv)
 
     raw_path = getattr(args, "data.raw")
-    label_path = getattr(args, "data.labels")
+    order_path = getattr(args, "data.order")
     output_dir = args.output_dir
     name = args.name
-    seed = args.seed
-    method = args.method
+    num = args.num
     test_sample_limit = args.test_sample_limit
 
     out_dir = Path(output_dir)
-    per_sample: Dict[str, Tuple[pd.DataFrame, pd.Series]] = {}
+    order = load_order(order_path)
 
-    with prepared_fcs_inputs(raw_path) as ready_fcs:
-        if not ready_fcs:
-            raise FileNotFoundError(f"No FCS inputs found at {raw_path}")
+    with prepared_csv_inputs(raw_path) as csv_paths:
+        if not csv_paths:
+            raise FileNotFoundError(f"No CSV inputs found at {raw_path}")
 
-        if label_path and is_flowjo_workspace(label_path):
-            with workspace_materialized(label_path) as workspace_path:
-                flowjo_samples = label_samples_from_flowjo_workspace_by_sample(
-                    workspace_path, ready_fcs
-                )
-            for sample_id, (features, labels) in flowjo_samples.items():
-                per_sample[_sanitize_sample_id(Path(sample_id))] = (features, labels)
-        else:
-            for fcs_path in ready_fcs:
-                data_df = parse_fcs_to_dataframe(str(fcs_path))
-                if label_path:
-                    data_df = apply_labels(label_path, data_df)
-                features, labels = extract_labels_from_dataframe(data_df)
-                per_sample[_sanitize_sample_id(fcs_path)] = (features, labels)
+        csv_paths = sorted(csv_paths, key=lambda p: p.name)
+        sample_count = len(csv_paths)
 
-    samples = sorted(per_sample.keys())
+        if set(order) != set(range(1, sample_count + 1)):
+            raise ValueError(
+                "Order must contain each sample index exactly once (1..n)."
+            )
+        if len(order) != sample_count:
+            raise ValueError("Order length must match number of samples.")
+        if num < 1 or num > sample_count:
+            raise ValueError("num must be within 1..n.")
+
+        per_sample: Dict[int, Tuple[pd.DataFrame, pd.Series]] = {}
+        for idx, csv_path in enumerate(csv_paths, start=1):
+            df = read_csv_dataframe(csv_path)
+            features, labels = extract_labels_from_dataframe(df)
+            per_sample[idx] = (features, labels)
+
     label_series = [labels for _, labels in per_sample.values()]
     id_to_label = build_label_key(label_series)
 
-    mapped_samples: Dict[str, Tuple[pd.DataFrame, pd.Series]] = {}
-    for sid, (features, labels) in per_sample.items():
-        mapped_samples[sid] = (features, map_labels_to_ints(labels, id_to_label))
-
-    if len(samples) == 1:
-        feats, labs = mapped_samples[samples[0]]
-        (train_feats, train_labels), (test_feats, test_labels) = split_train_test(
-            feats, labs, method=method, seed=seed
+    mapped_samples: Dict[int, Tuple[pd.DataFrame, pd.Series]] = {}
+    for sample_id, (features, labels) in per_sample.items():
+        mapped_samples[sample_id] = (
+            features,
+            map_labels_to_ints(labels, id_to_label),
         )
-        if train_labels is None or test_labels is None:
-            raise ValueError("Expected labels for single-sample split.")
 
-        write_gz_csv(train_feats, out_dir / f"{name}.train.matrix.csv.gz")
-        write_gz_series(train_labels, out_dir / f"{name}.train.labels.csv.gz")
-        _write_test_archives(out_dir, name, {samples[0]: (test_feats, test_labels)})
-        _write_label_key(out_dir, name, id_to_label)
-        return
-
-    rng = np.random.default_rng(seed)
-    chosen_train = rng.choice(samples)
-
-    remaining = [sid for sid in samples if sid != chosen_train]
-    if test_sample_limit is not None:
+    train_pos = num - 1
+    train_id = order[train_pos]
+    max_test = max(sample_count - 1, 0)
+    if test_sample_limit is None:
+        test_count = max_test
+    else:
         if test_sample_limit <= 0:
             raise ValueError("test-sample-limit must be a positive integer.")
-        if len(remaining) > test_sample_limit:
-            remaining = sorted(
-                rng.choice(remaining, size=test_sample_limit, replace=False)
+        if test_sample_limit > max_test:
+            print(
+                "Warning: test-sample-limit exceeds n-1; using all remaining samples.",
+                file=sys.stderr,
             )
+        test_count = min(test_sample_limit, max_test)
 
-    test_samples: Dict[str, Tuple[pd.DataFrame, pd.Series]] = {}
-    for sid in remaining:
-        test_samples[sid] = mapped_samples[sid]
+    test_ids: List[int] = []
+    for offset in range(1, test_count + 1):
+        test_ids.append(order[(train_pos + offset) % sample_count])
 
-    train_feats, train_labels = mapped_samples[chosen_train]
-    write_gz_csv(train_feats, out_dir / f"{name}.train.matrix.csv.gz")
-    write_gz_series(train_labels, out_dir / f"{name}.train.labels.csv.gz")
-
-    if not test_samples:
-        test_samples = {"empty": (pd.DataFrame(), pd.Series(dtype=int))}
-
-    _write_test_archives(out_dir, name, test_samples)
+    _write_sample_archives(out_dir, name, train_id, test_ids, mapped_samples)
     _write_label_key(out_dir, name, id_to_label)
 
 

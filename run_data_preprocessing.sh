@@ -26,7 +26,7 @@ rm -f "${out_dir}/data_import."*.matrix.gz \
 (cd "$repo_root" && python "preprocessing/data_preprocessing.py" \
   --name "data_import" \
   --output_dir "$out_dir" \
-  --data.raw "${script_dir}/out/data/data_import/${dataset_name}.data.gz" \
+  --data.raw "${script_dir}/out/data/data_import/${dataset_name}.data.tar.gz" \
   --data.order "${script_dir}/out/data/data_import/${dataset_name}.order.json.gz" \
   --data.attachments "${script_dir}/out/data/data_import/${dataset_name}.attachments.gz" \
   --num 1 \

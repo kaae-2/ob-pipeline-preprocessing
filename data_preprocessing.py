@@ -974,7 +974,10 @@ def main(argv: Optional[Sequence[str]] = None):
     train_pos = num - 1
     train_id = order[train_pos]
     max_test = max(sample_count - 1, 0)
+
     if test_sample_limit is None:
+        # Emit a short comment to stdout so CI/logs show the defaulting behavior.
+        print("# --test-sample-limit not provided; using all remaining samples")
         test_count = max_test
     else:
         if test_sample_limit <= 0:

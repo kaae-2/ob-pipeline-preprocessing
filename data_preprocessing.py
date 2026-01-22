@@ -20,6 +20,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -27,6 +28,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import fcsparser
 import numpy as np
 import pandas as pd
+
+try:
+    import pyarrow  # noqa: F401
+
+    _PYARROW_AVAILABLE = True
+except ImportError:
+    _PYARROW_AVAILABLE = False
 
 # Ensure multiprocessing uses spawn to avoid fork-related deadlocks with native extensions.
 try:
@@ -314,9 +322,19 @@ def prepared_csv_inputs(raw_input: str) -> Iterable[List[Path]]:
 
 def read_csv_dataframe(path: Path) -> pd.DataFrame:
     """Read a CSV or gzipped CSV into a DataFrame."""
+    engine = "pyarrow" if _PYARROW_AVAILABLE else None
+    read_kwargs = {"engine": engine} if engine else {}
     if path.suffix.lower() == ".gz" or path.name.lower().endswith(".csv.gz"):
-        return pd.read_csv(path, compression="gzip")
-    return pd.read_csv(path)
+        return pd.read_csv(path, compression="gzip", **read_kwargs)
+    return pd.read_csv(path, **read_kwargs)
+
+
+def _load_csv_sample(
+    sample_id: int, csv_path: Path, label_col: Optional[str]
+) -> Tuple[int, pd.DataFrame, pd.Series]:
+    df = read_csv_dataframe(csv_path)
+    features, labels = extract_labels_with_column(df, label_col)
+    return sample_id, features, labels
 
 
 def _flowjo_leaf_gate_paths(
@@ -526,6 +544,17 @@ def extract_labels_from_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Se
     labels = df[label_col]
     features = df.drop(columns=[label_col])
     return features, labels
+
+
+def extract_labels_with_column(
+    df: pd.DataFrame, label_col: Optional[str]
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """Return (features, labels) using a known label column when available."""
+    if label_col and label_col in df.columns:
+        labels = df[label_col]
+        features = df.drop(columns=[label_col])
+        return features, labels
+    return extract_labels_from_dataframe(df)
 
 
 def build_label_key(labels: Sequence[pd.Series]) -> Dict[int, str]:
@@ -898,10 +927,25 @@ def main(argv: Optional[Sequence[str]] = None):
             raise ValueError("num must be within 1..n.")
 
         per_sample: Dict[int, Tuple[pd.DataFrame, pd.Series]] = {}
-        for idx, csv_path in enumerate(csv_paths, start=1):
-            df = read_csv_dataframe(csv_path)
-            features, labels = extract_labels_from_dataframe(df)
-            per_sample[idx] = (features, labels)
+        first_path = csv_paths[0]
+        first_df = read_csv_dataframe(first_path)
+        label_col = find_label_column(first_df)
+        features, labels = extract_labels_with_column(first_df, label_col)
+        per_sample[1] = (features, labels)
+
+        remaining = list(enumerate(csv_paths[1:], start=2))
+        if remaining:
+            max_workers = min(
+                32, (os.cpu_count() or 1) + 4, len(remaining)
+            )
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(_load_csv_sample, idx, path, label_col)
+                    for idx, path in remaining
+                ]
+                for future in futures:
+                    sample_id, sample_features, sample_labels = future.result()
+                    per_sample[sample_id] = (sample_features, sample_labels)
 
     label_series = [labels for _, labels in per_sample.values()]
     id_to_label = build_label_key(label_series)

@@ -900,6 +900,12 @@ def parse_args() -> argparse.ArgumentParser:
         default=None,
         help="Limit number of test samples (order-based).",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Maximum number of CSV loading workers (default: auto).",
+    )
     return parser
 
 
@@ -913,6 +919,7 @@ def main(argv: Optional[Sequence[str]] = None):
     name = args.name
     num = args.num
     test_sample_limit = args.test_sample_limit
+    max_workers_arg = args.max_workers
     attachments_path = getattr(args, "data.attachments")
 
     if attachments_path:
@@ -962,6 +969,10 @@ def main(argv: Optional[Sequence[str]] = None):
             max_workers = min(
                 32, (os.cpu_count() or 1) + 4, len(remaining)
             )
+            if max_workers_arg is not None:
+                if max_workers_arg <= 0:
+                    raise ValueError("max-workers must be a positive integer.")
+                max_workers = min(max_workers, max_workers_arg)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
                     executor.submit(_load_csv_sample, idx, path, label_col)

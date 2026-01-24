@@ -30,6 +30,7 @@ rm -f "${out_dir}/data_import."*.matrix.gz \
   --data.order "${script_dir}/out/data/data_import/${dataset_name}.order.json.gz" \
   --data.attachments "${script_dir}/out/data/data_import/${dataset_name}.attachments.gz" \
   --num 1 \
+  --max-workers 4 \
   --test-sample-limit 5)
 
 # Symlink output folders to avoid per-file links

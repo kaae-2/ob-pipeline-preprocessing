@@ -937,8 +937,18 @@ def main(argv: Optional[Sequence[str]] = None):
             )
         if len(order) != sample_count:
             raise ValueError("Order length must match number of samples.")
-        if num < 1 or num > sample_count:
+        if num < 1:
             raise ValueError("num must be within 1..n.")
+        if num > sample_count:
+            wrapped_num = ((num - 1) % sample_count) + 1
+            print(
+                "Warning: num {} exceeds sample_count {}; using num {}. "
+                "Duplicate folds will be filtered in metrics.".format(
+                    num, sample_count, wrapped_num
+                ),
+                file=sys.stderr,
+            )
+            num = wrapped_num
 
         per_sample: Dict[int, Tuple[pd.DataFrame, pd.Series]] = {}
         first_path = csv_paths[0]

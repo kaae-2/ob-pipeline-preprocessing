@@ -725,6 +725,83 @@ def load_order(order_path: str) -> List[int]:
     return order
 
 
+def load_order_payload(order_path: str) -> Dict[str, object]:
+    """Load the full order JSON payload, preserving metadata."""
+    try:
+        payload = json.loads(read_bytes_handling_gzip(order_path).decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse order JSON: {order_path}") from exc
+    if not isinstance(payload, dict) or "order" not in payload:
+        raise ValueError("Order JSON must be an object with an 'order' key.")
+    order = payload.get("order")
+    if not isinstance(order, list) or not order:
+        raise ValueError("Order JSON must contain a non-empty list.")
+    if not all(isinstance(item, int) for item in order):
+        raise ValueError("Order entries must be integers.")
+    if len(set(order)) != len(order):
+        raise ValueError("Order entries must be unique.")
+    return payload
+
+
+def _normalize_ungated_labels(labels: pd.Series) -> pd.Series:
+    normalized = labels.copy()
+    lower = normalized.astype(str).str.strip().str.lower()
+    mask = normalized.isna() | (lower == "") | (lower == "unlabeled")
+    normalized.loc[mask] = "ungated"
+    return normalized
+
+
+def _subsample_training_data(
+    features: pd.DataFrame, labels: pd.Series, target_size: int
+) -> Tuple[pd.DataFrame, pd.Series]:
+    if target_size <= 0:
+        return features, labels
+    total = len(labels)
+    if target_size >= total:
+        print(
+            "Warning: sub-sampling size exceeds training set; using all cells.",
+            file=sys.stderr,
+        )
+        return features, labels
+
+    counts = labels.value_counts(dropna=False)
+    expected = counts / total * target_size
+    base = expected.apply(np.floor).astype(int)
+    base = base.clip(upper=counts)
+    allocated = int(base.sum())
+    remaining = target_size - allocated
+
+    if remaining > 0:
+        fractional = (expected - base).rename("fractional")
+        tie_break = counts.rename("count")
+        priority = (
+            pd.concat([fractional, tie_break], axis=1)
+            .sort_values(by=["fractional", "count"], ascending=[False, True])
+            .index
+        )
+        for label in priority:
+            if remaining <= 0:
+                break
+            if base[label] < counts[label]:
+                base[label] += 1
+                remaining -= 1
+
+    rng = np.random.default_rng(0)
+    selected_indices: List[int] = []
+    for label, take_count in base.items():
+        if take_count <= 0:
+            continue
+        label_indices = labels[labels == label].index.to_numpy()
+        if take_count >= len(label_indices):
+            chosen = label_indices
+        else:
+            chosen = rng.choice(label_indices, size=take_count, replace=False)
+        selected_indices.extend(chosen.tolist())
+
+    selected_indices = sorted(selected_indices)
+    return features.loc[selected_indices], labels.loc[selected_indices]
+
+
 def label_samples_from_flowjo_workspace_by_sample(
     workspace_path: str, fcs_paths: Sequence[Path]
 ) -> Dict[str, Tuple[pd.DataFrame, pd.Series]]:
@@ -929,7 +1006,33 @@ def main(argv: Optional[Sequence[str]] = None):
         )
 
     out_dir = Path(output_dir)
-    order = load_order(order_path)
+    order_payload = load_order_payload(order_path)
+    order = order_payload["order"]
+    metadata = order_payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    sub_sampling_raw = metadata.get("sub_sampling", 0)
+    try:
+        if isinstance(sub_sampling_raw, bool):
+            sub_sampling = int(sub_sampling_raw)
+        elif isinstance(sub_sampling_raw, (int, float)):
+            sub_sampling = int(sub_sampling_raw)
+        elif isinstance(sub_sampling_raw, str) and sub_sampling_raw.strip().isdigit():
+            sub_sampling = int(sub_sampling_raw.strip())
+        else:
+            raise ValueError
+    except Exception:
+        print(
+            "Warning: invalid sub_sampling metadata; defaulting to 0.",
+            file=sys.stderr,
+        )
+        sub_sampling = 0
+    if sub_sampling < 0:
+        print(
+            "Warning: sub_sampling metadata must be non-negative; defaulting to 0.",
+            file=sys.stderr,
+        )
+        sub_sampling = 0
 
     with prepared_csv_inputs(raw_path) as csv_paths:
         if not csv_paths:
@@ -982,6 +1085,20 @@ def main(argv: Optional[Sequence[str]] = None):
                     sample_id, sample_features, sample_labels = future.result()
                     per_sample[sample_id] = (sample_features, sample_labels)
 
+    train_pos = num - 1
+    train_id = order[train_pos]
+
+    if sub_sampling > 0:
+        for sample_id, (features, labels) in per_sample.items():
+            if labels is None:
+                continue
+            per_sample[sample_id] = (features, _normalize_ungated_labels(labels))
+        train_features, train_labels = per_sample[train_id]
+        train_features, train_labels = _subsample_training_data(
+            train_features, train_labels, sub_sampling
+        )
+        per_sample[train_id] = (train_features, train_labels)
+
     label_series = [labels for _, labels in per_sample.values()]
     id_to_label = build_label_key(label_series)
 
@@ -992,8 +1109,6 @@ def main(argv: Optional[Sequence[str]] = None):
             map_labels_to_ints(labels, id_to_label),
         )
 
-    train_pos = num - 1
-    train_id = order[train_pos]
     max_test = max(sample_count - 1, 0)
 
     if test_sample_limit is None:

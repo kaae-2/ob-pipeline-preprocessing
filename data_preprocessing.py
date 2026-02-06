@@ -568,7 +568,7 @@ def build_label_key(labels: Sequence[pd.Series]) -> Dict[int, str]:
         for value in values:
             if not value:
                 continue
-            if value.lower() == "unlabeled":
+            if value.lower() in {"unlabeled", "ungated"}:
                 continue
             label_set.add(value)
     ordered = sorted(label_set)
@@ -586,7 +586,7 @@ def map_labels_to_ints(
             mapped.append(0)
             continue
         text = str(value).strip()
-        if not text or text.lower() == "unlabeled":
+        if not text or text.lower() in {"unlabeled", "ungated"}:
             mapped.append(0)
             continue
         mapped.append(label_to_id.get(text, 0))
@@ -746,8 +746,13 @@ def load_order_payload(order_path: str) -> Dict[str, object]:
 def _normalize_ungated_labels(labels: pd.Series) -> pd.Series:
     normalized = labels.copy()
     lower = normalized.astype(str).str.strip().str.lower()
-    mask = normalized.isna() | (lower == "") | (lower == "unlabeled")
-    normalized.loc[mask] = "ungated"
+    mask = (
+        normalized.isna()
+        | (lower == "")
+        | (lower == "unlabeled")
+        | (lower == "ungated")
+    )
+    normalized.loc[mask] = "unlabeled"
     return normalized
 
 

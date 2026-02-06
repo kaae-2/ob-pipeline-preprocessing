@@ -526,6 +526,8 @@ LABEL_COLUMN_CANDIDATES = (
     "cluster_id",
 )
 
+UNLABELED_VALUES = {"", "unlabeled", "ungated"}
+
 
 def find_label_column(df: pd.DataFrame) -> Optional[str]:
     """Return the most likely label column name based on common conventions."""
@@ -568,7 +570,7 @@ def build_label_key(labels: Sequence[pd.Series]) -> Dict[int, str]:
         for value in values:
             if not value:
                 continue
-            if value.lower() in {"unlabeled", "ungated"}:
+            if value.lower() in UNLABELED_VALUES:
                 continue
             label_set.add(value)
     ordered = sorted(label_set)
@@ -586,7 +588,7 @@ def map_labels_to_ints(
             mapped.append(0)
             continue
         text = str(value).strip()
-        if not text or text.lower() in {"unlabeled", "ungated"}:
+        if not text or text.lower() in UNLABELED_VALUES:
             mapped.append(0)
             continue
         mapped.append(label_to_id.get(text, 0))
@@ -743,15 +745,12 @@ def load_order_payload(order_path: str) -> Dict[str, object]:
     return payload
 
 
-def _normalize_ungated_labels(labels: pd.Series) -> pd.Series:
+def _normalize_label_series(labels: pd.Series) -> pd.Series:
     normalized = labels.copy()
-    lower = normalized.astype(str).str.strip().str.lower()
-    mask = (
-        normalized.isna()
-        | (lower == "")
-        | (lower == "unlabeled")
-        | (lower == "ungated")
-    )
+    stripped = normalized.astype(str).str.strip()
+    lower = stripped.str.lower()
+    mask = normalized.isna() | lower.isin(UNLABELED_VALUES)
+    normalized = stripped
     normalized.loc[mask] = "unlabeled"
     return normalized
 
@@ -1090,14 +1089,15 @@ def main(argv: Optional[Sequence[str]] = None):
                     sample_id, sample_features, sample_labels = future.result()
                     per_sample[sample_id] = (sample_features, sample_labels)
 
+    for sample_id, (features, labels) in per_sample.items():
+        if labels is None:
+            continue
+        per_sample[sample_id] = (features, _normalize_label_series(labels))
+
     train_pos = num - 1
     train_id = order[train_pos]
 
     if sub_sampling > 0:
-        for sample_id, (features, labels) in per_sample.items():
-            if labels is None:
-                continue
-            per_sample[sample_id] = (features, _normalize_ungated_labels(labels))
         train_features, train_labels = per_sample[train_id]
         train_features, train_labels = _subsample_training_data(
             train_features, train_labels, sub_sampling

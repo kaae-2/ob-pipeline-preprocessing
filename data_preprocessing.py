@@ -13,6 +13,7 @@ Args:
 """
 
 import argparse
+import csv
 import gzip
 import json
 import os
@@ -21,7 +22,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -330,6 +331,23 @@ def read_csv_dataframe(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, **read_kwargs)
 
 
+def read_csv_header(path: Path) -> List[str]:
+    if path.suffix.lower() == ".gz" or path.name.lower().endswith(".csv.gz"):
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
+            reader = csv.reader(fh)
+            try:
+                return next(reader)
+            except StopIteration as exc:
+                raise ValueError(f"CSV file has no header row: {path.name}") from exc
+
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh)
+        try:
+            return next(reader)
+        except StopIteration as exc:
+            raise ValueError(f"CSV file has no header row: {path.name}") from exc
+
+
 def _load_csv_sample(
     sample_id: int, csv_path: Path, label_col: Optional[str]
 ) -> Tuple[int, pd.DataFrame, pd.Series]:
@@ -527,6 +545,7 @@ LABEL_COLUMN_CANDIDATES = (
 )
 
 UNLABELED_VALUES = {"", "unlabeled", "ungated"}
+TAR_GZIP_COMPRESSLEVEL = 1
 
 
 def find_label_column(df: pd.DataFrame) -> Optional[str]:
@@ -654,11 +673,15 @@ def _write_test_archives(
             matrix_files.append(matrix_file)
             label_files.append(label_file)
 
-        with tarfile.open(matrices_path, "w:gz") as tar:
+        with tarfile.open(
+            matrices_path, "w:gz", compresslevel=TAR_GZIP_COMPRESSLEVEL
+        ) as tar:
             for path in sorted(matrix_files, key=lambda p: p.name):
                 tar.add(path, arcname=path.name)
 
-        with tarfile.open(labels_path, "w:gz") as tar:
+        with tarfile.open(
+            labels_path, "w:gz", compresslevel=TAR_GZIP_COMPRESSLEVEL
+        ) as tar:
             for path in sorted(label_files, key=lambda p: p.name):
                 tar.add(path, arcname=path.name)
 
@@ -682,10 +705,14 @@ def _write_sample_archives(
         write_csv(train_features, train_matrix_file)
         write_series_csv(train_labels, train_label_file)
 
-        with tarfile.open(train_matrix_path, "w:gz") as tar:
+        with tarfile.open(
+            train_matrix_path, "w:gz", compresslevel=TAR_GZIP_COMPRESSLEVEL
+        ) as tar:
             tar.add(train_matrix_file, arcname=train_matrix_file.name)
 
-        with tarfile.open(train_labels_path, "w:gz") as tar:
+        with tarfile.open(
+            train_labels_path, "w:gz", compresslevel=TAR_GZIP_COMPRESSLEVEL
+        ) as tar:
             tar.add(train_label_file, arcname=train_label_file.name)
 
         test_matrix_files: List[Path] = []
@@ -699,11 +726,15 @@ def _write_sample_archives(
             test_matrix_files.append(matrix_file)
             test_label_files.append(label_file)
 
-        with tarfile.open(test_matrices_path, "w:gz") as tar:
+        with tarfile.open(
+            test_matrices_path, "w:gz", compresslevel=TAR_GZIP_COMPRESSLEVEL
+        ) as tar:
             for path in test_matrix_files:
                 tar.add(path, arcname=path.name)
 
-        with tarfile.open(test_labels_path, "w:gz") as tar:
+        with tarfile.open(
+            test_labels_path, "w:gz", compresslevel=TAR_GZIP_COMPRESSLEVEL
+        ) as tar:
             for path in test_label_files:
                 tar.add(path, arcname=path.name)
 
@@ -1065,29 +1096,24 @@ def main(argv: Optional[Sequence[str]] = None):
             num = wrapped_num
 
         per_sample: Dict[int, Tuple[pd.DataFrame, pd.Series]] = {}
-        first_path = csv_paths[0]
-        first_df = read_csv_dataframe(first_path)
-        label_col = find_label_column(first_df)
-        features, labels = extract_labels_with_column(first_df, label_col)
-        per_sample[1] = (features, labels)
+        first_header = read_csv_header(csv_paths[0])
+        label_col = find_label_column(pd.DataFrame(columns=first_header))
 
-        remaining = list(enumerate(csv_paths[1:], start=2))
-        if remaining:
-            max_workers = min(
-                32, (os.cpu_count() or 1) + 4, len(remaining)
-            )
-            if max_workers_arg is not None:
-                if max_workers_arg <= 0:
-                    raise ValueError("max-workers must be a positive integer.")
-                max_workers = min(max_workers, max_workers_arg)
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(_load_csv_sample, idx, path, label_col)
-                    for idx, path in remaining
-                ]
-                for future in futures:
-                    sample_id, sample_features, sample_labels = future.result()
-                    per_sample[sample_id] = (sample_features, sample_labels)
+        indexed_paths = list(enumerate(csv_paths, start=1))
+        max_workers = min(64, max(4, (os.cpu_count() or 1) * 2), len(indexed_paths))
+        if max_workers_arg is not None:
+            if max_workers_arg <= 0:
+                raise ValueError("max-workers must be a positive integer.")
+            max_workers = min(max_workers_arg, len(indexed_paths))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_load_csv_sample, idx, path, label_col)
+                for idx, path in indexed_paths
+            ]
+            for future in as_completed(futures):
+                sample_id, sample_features, sample_labels = future.result()
+                per_sample[sample_id] = (sample_features, sample_labels)
 
     for sample_id, (features, labels) in per_sample.items():
         if labels is None:

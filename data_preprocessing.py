@@ -396,6 +396,26 @@ def _load_csv_labels_only(
     return sample_id, labels
 
 
+def _collect_sample_label_values(
+    sample_id: int, csv_path: Path, preferred_label_col: Optional[str]
+) -> Tuple[int, set[str]]:
+    header = read_csv_header(csv_path)
+    if preferred_label_col and preferred_label_col in header:
+        label_col = preferred_label_col
+    else:
+        label_col = find_label_column_from_headers(header)
+
+    if label_col is None:
+        return sample_id, set()
+
+    labels = _read_csv_column(csv_path, label_col)
+    normalized = _normalize_label_series(labels)
+    values = normalized.dropna().astype(str).str.strip()
+    return sample_id, {
+        value for value in values if value and value.lower() not in UNLABELED_VALUES
+    }
+
+
 def _flowjo_leaf_gate_paths(
     workspace, sample_id: str
 ) -> List[Tuple[str, Tuple[str, ...]]]:
@@ -640,6 +660,18 @@ def build_label_key(labels: Sequence[pd.Series]) -> Dict[int, str]:
     return {idx + 1: label for idx, label in enumerate(ordered)}
 
 
+def build_label_key_from_values(label_values: Iterable[str]) -> Dict[int, str]:
+    """Build a stable id_to_label mapping from normalized label values."""
+    ordered = sorted(
+        {
+            value
+            for value in label_values
+            if value and value.lower() not in UNLABELED_VALUES
+        }
+    )
+    return {idx + 1: label for idx, label in enumerate(ordered)}
+
+
 def map_labels_to_ints(
     labels: pd.Series, id_to_label: Dict[int, str]
 ) -> pd.Series:
@@ -767,6 +799,76 @@ def _write_sample_archives(
             label_file = Path(tmpdir) / f"{name}-label-{test_id}.csv"
             write_csv(features, matrix_file)
             write_series_csv(labels, label_file)
+            test_matrix_files.append(matrix_file)
+            test_label_files.append(label_file)
+
+        with tarfile.open(
+            test_matrices_path, "w:gz", compresslevel=TAR_GZIP_COMPRESSLEVEL
+        ) as tar:
+            for path in test_matrix_files:
+                tar.add(path, arcname=path.name)
+
+        with tarfile.open(
+            test_labels_path, "w:gz", compresslevel=TAR_GZIP_COMPRESSLEVEL
+        ) as tar:
+            for path in test_label_files:
+                tar.add(path, arcname=path.name)
+
+
+def _write_sample_archives_from_paths(
+    out_dir: Path,
+    name: str,
+    train_id: int,
+    test_ids: Sequence[int],
+    sample_paths: Dict[int, Path],
+    id_to_label: Dict[int, str],
+    preferred_label_col: Optional[str],
+    sub_sampling: int,
+) -> None:
+    train_matrix_path = out_dir / f"{name}.train.matrix.tar.gz"
+    train_labels_path = out_dir / f"{name}.train.labels.tar.gz"
+    test_matrices_path = out_dir / f"{name}.test.matrices.tar.gz"
+    test_labels_path = out_dir / f"{name}.test.labels.tar.gz"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _, train_features, train_labels = _load_csv_sample(
+            train_id, sample_paths[train_id], preferred_label_col
+        )
+        train_labels = _normalize_label_series(train_labels)
+        if sub_sampling > 0:
+            train_features, train_labels = _subsample_training_data(
+                train_features, train_labels, sub_sampling
+            )
+        mapped_train_labels = map_labels_to_ints(train_labels, id_to_label)
+
+        train_matrix_file = Path(tmpdir) / f"{name}-data-{train_id}.csv"
+        train_label_file = Path(tmpdir) / f"{name}-label-{train_id}.csv"
+        write_csv(train_features, train_matrix_file)
+        write_series_csv(mapped_train_labels, train_label_file)
+
+        with tarfile.open(
+            train_matrix_path, "w:gz", compresslevel=TAR_GZIP_COMPRESSLEVEL
+        ) as tar:
+            tar.add(train_matrix_file, arcname=train_matrix_file.name)
+
+        with tarfile.open(
+            train_labels_path, "w:gz", compresslevel=TAR_GZIP_COMPRESSLEVEL
+        ) as tar:
+            tar.add(train_label_file, arcname=train_label_file.name)
+
+        test_matrix_files: List[Path] = []
+        test_label_files: List[Path] = []
+        for test_id in test_ids:
+            _, test_features, test_labels = _load_csv_sample(
+                test_id, sample_paths[test_id], preferred_label_col
+            )
+            test_labels = _normalize_label_series(test_labels)
+            mapped_test_labels = map_labels_to_ints(test_labels, id_to_label)
+
+            matrix_file = Path(tmpdir) / f"{name}-data-{test_id}.csv"
+            label_file = Path(tmpdir) / f"{name}-label-{test_id}.csv"
+            write_csv(test_features, matrix_file)
+            write_series_csv(mapped_test_labels, label_file)
             test_matrix_files.append(matrix_file)
             test_label_files.append(label_file)
 
@@ -1160,70 +1262,41 @@ def main(argv: Optional[Sequence[str]] = None):
         test_ids: List[int] = []
         for offset in range(1, test_count + 1):
             test_ids.append(order[(train_pos + offset) % sample_count])
-        selected_sample_ids = set([train_id] + test_ids)
 
         first_header = read_csv_header(csv_paths[0])
         label_col = find_label_column_from_headers(first_header)
 
         indexed_paths = list(enumerate(csv_paths, start=1))
+        sample_paths = {idx: path for idx, path in indexed_paths}
         max_workers = min(64, max(4, (os.cpu_count() or 1) * 2), len(indexed_paths))
         if max_workers_arg is not None:
             if max_workers_arg <= 0:
                 raise ValueError("max-workers must be a positive integer.")
             max_workers = min(max_workers_arg, len(indexed_paths))
 
-        selected_samples: Dict[int, Tuple[pd.DataFrame, pd.Series]] = {}
-        labels_by_sample: Dict[int, pd.Series] = {}
+        label_values: set[str] = set()
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {}
+            futures = []
             for idx, path in indexed_paths:
-                if idx in selected_sample_ids:
-                    future = executor.submit(_load_csv_sample, idx, path, label_col)
-                    futures[future] = "full"
-                else:
-                    future = executor.submit(_load_csv_labels_only, idx, path, label_col)
-                    futures[future] = "labels"
+                futures.append(
+                    executor.submit(_collect_sample_label_values, idx, path, label_col)
+                )
 
             for future in as_completed(futures):
-                mode = futures[future]
-                if mode == "full":
-                    sample_id, sample_features, sample_labels = future.result()
-                    selected_samples[sample_id] = (sample_features, sample_labels)
-                    labels_by_sample[sample_id] = sample_labels
-                    continue
-                sample_id, sample_labels = future.result()
-                labels_by_sample[sample_id] = sample_labels
+                _, sample_values = future.result()
+                label_values.update(sample_values)
 
-    if len(labels_by_sample) != sample_count:
-        raise RuntimeError(
-            "Failed to collect label vectors for all samples in preprocessing."
-        )
-
-    for sample_id in sorted(labels_by_sample):
-        normalized = _normalize_label_series(labels_by_sample[sample_id])
-        labels_by_sample[sample_id] = normalized
-        if sample_id in selected_samples:
-            sample_features, _ = selected_samples[sample_id]
-            selected_samples[sample_id] = (sample_features, normalized)
-
-    if sub_sampling > 0:
-        train_features, train_labels = selected_samples[train_id]
-        train_features, train_labels = _subsample_training_data(
-            train_features, train_labels, sub_sampling
-        )
-        selected_samples[train_id] = (train_features, train_labels)
-
-    label_series = [labels_by_sample[sample_id] for sample_id in sorted(labels_by_sample)]
-    id_to_label = build_label_key(label_series)
-
-    mapped_samples: Dict[int, Tuple[pd.DataFrame, pd.Series]] = {}
-    for sample_id, (features, labels) in selected_samples.items():
-        mapped_samples[sample_id] = (
-            features,
-            map_labels_to_ints(labels, id_to_label),
-        )
-
-    _write_sample_archives(out_dir, name, train_id, test_ids, mapped_samples)
+    id_to_label = build_label_key_from_values(label_values)
+    _write_sample_archives_from_paths(
+        out_dir=out_dir,
+        name=name,
+        train_id=train_id,
+        test_ids=test_ids,
+        sample_paths=sample_paths,
+        id_to_label=id_to_label,
+        preferred_label_col=label_col,
+        sub_sampling=sub_sampling,
+    )
     _write_label_key(out_dir, name, id_to_label)
 
 

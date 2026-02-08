@@ -1286,18 +1286,18 @@ def main(argv: Optional[Sequence[str]] = None):
                 _, sample_values = future.result()
                 label_values.update(sample_values)
 
-    id_to_label = build_label_key_from_values(label_values)
-    _write_sample_archives_from_paths(
-        out_dir=out_dir,
-        name=name,
-        train_id=train_id,
-        test_ids=test_ids,
-        sample_paths=sample_paths,
-        id_to_label=id_to_label,
-        preferred_label_col=label_col,
-        sub_sampling=sub_sampling,
-    )
-    _write_label_key(out_dir, name, id_to_label)
+        id_to_label = build_label_key_from_values(label_values)
+        _write_sample_archives_from_paths(
+            out_dir=out_dir,
+            name=name,
+            train_id=train_id,
+            test_ids=test_ids,
+            sample_paths=sample_paths,
+            id_to_label=id_to_label,
+            preferred_label_col=label_col,
+            sub_sampling=sub_sampling,
+        )
+        _write_label_key(out_dir, name, id_to_label)
 
 
 if __name__ == "__main__":

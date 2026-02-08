@@ -348,12 +348,52 @@ def read_csv_header(path: Path) -> List[str]:
             raise ValueError(f"CSV file has no header row: {path.name}") from exc
 
 
+def _read_csv_column(path: Path, column_name: str) -> pd.Series:
+    engine = "pyarrow" if _PYARROW_AVAILABLE else None
+    read_kwargs = {"engine": engine} if engine else {}
+    if path.suffix.lower() == ".gz" or path.name.lower().endswith(".csv.gz"):
+        df = pd.read_csv(path, compression="gzip", usecols=[column_name], **read_kwargs)
+    else:
+        df = pd.read_csv(path, usecols=[column_name], **read_kwargs)
+    return df[column_name]
+
+
+def _read_csv_row_count(path: Path, first_column: str) -> int:
+    engine = "pyarrow" if _PYARROW_AVAILABLE else None
+    read_kwargs = {"engine": engine} if engine else {}
+    if path.suffix.lower() == ".gz" or path.name.lower().endswith(".csv.gz"):
+        df = pd.read_csv(path, compression="gzip", usecols=[first_column], **read_kwargs)
+    else:
+        df = pd.read_csv(path, usecols=[first_column], **read_kwargs)
+    return len(df)
+
+
 def _load_csv_sample(
     sample_id: int, csv_path: Path, label_col: Optional[str]
 ) -> Tuple[int, pd.DataFrame, pd.Series]:
     df = read_csv_dataframe(csv_path)
     features, labels = extract_labels_with_column(df, label_col)
     return sample_id, features, labels
+
+
+def _load_csv_labels_only(
+    sample_id: int, csv_path: Path, preferred_label_col: Optional[str]
+) -> Tuple[int, pd.Series]:
+    header = read_csv_header(csv_path)
+    label_col = None
+    if preferred_label_col and preferred_label_col in header:
+        label_col = preferred_label_col
+    else:
+        label_col = find_label_column_from_headers(header)
+
+    if label_col is None:
+        if not header:
+            raise ValueError(f"CSV file has no header row: {csv_path.name}")
+        row_count = _read_csv_row_count(csv_path, header[0])
+        return sample_id, pd.Series(["unlabeled"] * row_count, name="label")
+
+    labels = _read_csv_column(csv_path, label_col)
+    return sample_id, labels
 
 
 def _flowjo_leaf_gate_paths(
@@ -548,13 +588,17 @@ UNLABELED_VALUES = {"", "unlabeled", "ungated"}
 TAR_GZIP_COMPRESSLEVEL = 1
 
 
-def find_label_column(df: pd.DataFrame) -> Optional[str]:
-    """Return the most likely label column name based on common conventions."""
-    lower_map = {str(col).strip().lower(): col for col in df.columns}
+def find_label_column_from_headers(headers: Sequence[object]) -> Optional[str]:
+    lower_map = {str(col).strip().lower(): str(col) for col in headers}
     for candidate in LABEL_COLUMN_CANDIDATES:
         if candidate in lower_map:
             return lower_map[candidate]
     return None
+
+
+def find_label_column(df: pd.DataFrame) -> Optional[str]:
+    """Return the most likely label column name based on common conventions."""
+    return find_label_column_from_headers(df.columns)
 
 
 def extract_labels_from_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
@@ -1095,9 +1139,31 @@ def main(argv: Optional[Sequence[str]] = None):
             )
             num = wrapped_num
 
-        per_sample: Dict[int, Tuple[pd.DataFrame, pd.Series]] = {}
+        train_pos = num - 1
+        train_id = order[train_pos]
+
+        max_test = max(sample_count - 1, 0)
+        if test_sample_limit is None:
+            # Emit a short comment to stdout so CI/logs show the defaulting behavior.
+            print("# --test-sample-limit not provided; using all remaining samples")
+            test_count = max_test
+        else:
+            if test_sample_limit <= 0:
+                raise ValueError("test-sample-limit must be a positive integer.")
+            if test_sample_limit > max_test:
+                print(
+                    "Warning: test-sample-limit exceeds n-1; using all remaining samples.",
+                    file=sys.stderr,
+                )
+            test_count = min(test_sample_limit, max_test)
+
+        test_ids: List[int] = []
+        for offset in range(1, test_count + 1):
+            test_ids.append(order[(train_pos + offset) % sample_count])
+        selected_sample_ids = set([train_id] + test_ids)
+
         first_header = read_csv_header(csv_paths[0])
-        label_col = find_label_column(pd.DataFrame(columns=first_header))
+        label_col = find_label_column_from_headers(first_header)
 
         indexed_paths = list(enumerate(csv_paths, start=1))
         max_workers = min(64, max(4, (os.cpu_count() or 1) * 2), len(indexed_paths))
@@ -1106,59 +1172,56 @@ def main(argv: Optional[Sequence[str]] = None):
                 raise ValueError("max-workers must be a positive integer.")
             max_workers = min(max_workers_arg, len(indexed_paths))
 
+        selected_samples: Dict[int, Tuple[pd.DataFrame, pd.Series]] = {}
+        labels_by_sample: Dict[int, pd.Series] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(_load_csv_sample, idx, path, label_col)
-                for idx, path in indexed_paths
-            ]
+            futures = {}
+            for idx, path in indexed_paths:
+                if idx in selected_sample_ids:
+                    future = executor.submit(_load_csv_sample, idx, path, label_col)
+                    futures[future] = "full"
+                else:
+                    future = executor.submit(_load_csv_labels_only, idx, path, label_col)
+                    futures[future] = "labels"
+
             for future in as_completed(futures):
-                sample_id, sample_features, sample_labels = future.result()
-                per_sample[sample_id] = (sample_features, sample_labels)
+                mode = futures[future]
+                if mode == "full":
+                    sample_id, sample_features, sample_labels = future.result()
+                    selected_samples[sample_id] = (sample_features, sample_labels)
+                    labels_by_sample[sample_id] = sample_labels
+                    continue
+                sample_id, sample_labels = future.result()
+                labels_by_sample[sample_id] = sample_labels
 
-    for sample_id, (features, labels) in per_sample.items():
-        if labels is None:
-            continue
-        per_sample[sample_id] = (features, _normalize_label_series(labels))
+    if len(labels_by_sample) != sample_count:
+        raise RuntimeError(
+            "Failed to collect label vectors for all samples in preprocessing."
+        )
 
-    train_pos = num - 1
-    train_id = order[train_pos]
+    for sample_id in sorted(labels_by_sample):
+        normalized = _normalize_label_series(labels_by_sample[sample_id])
+        labels_by_sample[sample_id] = normalized
+        if sample_id in selected_samples:
+            sample_features, _ = selected_samples[sample_id]
+            selected_samples[sample_id] = (sample_features, normalized)
 
     if sub_sampling > 0:
-        train_features, train_labels = per_sample[train_id]
+        train_features, train_labels = selected_samples[train_id]
         train_features, train_labels = _subsample_training_data(
             train_features, train_labels, sub_sampling
         )
-        per_sample[train_id] = (train_features, train_labels)
+        selected_samples[train_id] = (train_features, train_labels)
 
-    label_series = [labels for _, labels in per_sample.values()]
+    label_series = [labels_by_sample[sample_id] for sample_id in sorted(labels_by_sample)]
     id_to_label = build_label_key(label_series)
 
     mapped_samples: Dict[int, Tuple[pd.DataFrame, pd.Series]] = {}
-    for sample_id, (features, labels) in per_sample.items():
+    for sample_id, (features, labels) in selected_samples.items():
         mapped_samples[sample_id] = (
             features,
             map_labels_to_ints(labels, id_to_label),
         )
-
-    max_test = max(sample_count - 1, 0)
-
-    if test_sample_limit is None:
-        # Emit a short comment to stdout so CI/logs show the defaulting behavior.
-        print("# --test-sample-limit not provided; using all remaining samples")
-        test_count = max_test
-    else:
-        if test_sample_limit <= 0:
-            raise ValueError("test-sample-limit must be a positive integer.")
-        if test_sample_limit > max_test:
-            print(
-                "Warning: test-sample-limit exceeds n-1; using all remaining samples.",
-                file=sys.stderr,
-            )
-        test_count = min(test_sample_limit, max_test)
-
-    test_ids: List[int] = []
-    for offset in range(1, test_count + 1):
-        test_ids.append(order[(train_pos + offset) % sample_count])
 
     _write_sample_archives(out_dir, name, train_id, test_ids, mapped_samples)
     _write_label_key(out_dir, name, id_to_label)

@@ -725,9 +725,19 @@ def write_series_csv(series: pd.Series, path: Path, header: bool = False) -> Non
     series.to_csv(path, index=False, header=header)
 
 
-def _write_label_key(out_dir: Path, name: str, id_to_label: Dict[int, str]) -> None:
+def _write_label_key(
+    out_dir: Path,
+    name: str,
+    id_to_label: Dict[int, str],
+    dataset_name: Optional[str] = None,
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {"id_to_label": {str(k): v for k, v in id_to_label.items()}}
+    metadata: Dict[str, str] = {}
+    if dataset_name is not None and dataset_name.strip():
+        metadata["dataset_name"] = dataset_name.strip()
+    if metadata:
+        payload["metadata"] = metadata
     key_path = out_dir / f"{name}.label_key.json.gz"
     with gzip.open(key_path, "wt") as handle:
         json.dump(payload, handle, indent=2)
@@ -1192,6 +1202,10 @@ def main(argv: Optional[Sequence[str]] = None):
     metadata = order_payload.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
+    dataset_name_raw = metadata.get("dataset_name")
+    dataset_name: Optional[str] = None
+    if isinstance(dataset_name_raw, str) and dataset_name_raw.strip():
+        dataset_name = dataset_name_raw.strip()
     sub_sampling_raw = metadata.get("sub_sampling", 0)
     try:
         if isinstance(sub_sampling_raw, bool):
@@ -1297,7 +1311,7 @@ def main(argv: Optional[Sequence[str]] = None):
             preferred_label_col=label_col,
             sub_sampling=sub_sampling,
         )
-        _write_label_key(out_dir, name, id_to_label)
+        _write_label_key(out_dir, name, id_to_label, dataset_name=dataset_name)
 
 
 if __name__ == "__main__":

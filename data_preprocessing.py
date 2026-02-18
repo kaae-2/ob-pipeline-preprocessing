@@ -362,7 +362,9 @@ def _read_csv_row_count(path: Path, first_column: str) -> int:
     engine = "pyarrow" if _PYARROW_AVAILABLE else None
     read_kwargs = {"engine": engine} if engine else {}
     if path.suffix.lower() == ".gz" or path.name.lower().endswith(".csv.gz"):
-        df = pd.read_csv(path, compression="gzip", usecols=[first_column], **read_kwargs)
+        df = pd.read_csv(
+            path, compression="gzip", usecols=[first_column], **read_kwargs
+        )
     else:
         df = pd.read_csv(path, usecols=[first_column], **read_kwargs)
     return len(df)
@@ -604,7 +606,7 @@ LABEL_COLUMN_CANDIDATES = (
     "cluster_id",
 )
 
-UNLABELED_VALUES = {"", "unlabeled", "ungated"}
+UNLABELED_VALUES = {"", "unlabeled", "ungated", "debris", "unknown", "other", "noise"}
 TAR_GZIP_COMPRESSLEVEL = 1
 
 
@@ -672,9 +674,7 @@ def build_label_key_from_values(label_values: Iterable[str]) -> Dict[int, str]:
     return {idx + 1: label for idx, label in enumerate(ordered)}
 
 
-def map_labels_to_ints(
-    labels: pd.Series, id_to_label: Dict[int, str]
-) -> pd.Series:
+def map_labels_to_ints(labels: pd.Series, id_to_label: Dict[int, str]) -> pd.Series:
     """Map string labels to integer ids using id_to_label; unlabeled -> 0."""
     label_to_id = {label: idx for idx, label in id_to_label.items()}
     mapped: List[int] = []

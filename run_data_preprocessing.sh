@@ -5,7 +5,7 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 out_dir="${script_dir}/out/data/data_import/preprocessing/data_preprocessing/default"
-dataset_name="FR-FCM-Z2KP_virus_final"
+dataset_name="FR-FCM-Z2KP-covid"
 
 train_matrix="${out_dir}/data_import.train.matrix.tar.gz"
 train_labels="${out_dir}/data_import.train.labels.tar.gz"
@@ -13,11 +13,7 @@ test_matrices="${out_dir}/data_import.test.matrices.tar.gz"
 test_labels="${out_dir}/data_import.test.labels.tar.gz"
 label_key="${out_dir}/data_import.label_key.json.gz"
 
-rm -f "${out_dir}/data_import."*.matrix.gz \
-      "${out_dir}/data_import."*.true_labels*.gz \
-      "${out_dir}/data_import.test.matrix.csv.gz" \
-      "${out_dir}/data_import.test.labels.csv.gz" \
-      "${out_dir}/data_import.test.matrices.tar.gz" \
+rm -f "${out_dir}/data_import.test.matrices.tar.gz" \
       "${out_dir}/data_import.test.labels.tar.gz" \
       "${out_dir}/data_import.train.matrix.tar.gz" \
       "${out_dir}/data_import.train.labels.tar.gz" \
@@ -28,7 +24,6 @@ rm -f "${out_dir}/data_import."*.matrix.gz \
   --output_dir "$out_dir" \
   --data.raw "${script_dir}/out/data/data_import/${dataset_name}.data.tar.gz" \
   --data.order "${script_dir}/out/data/data_import/${dataset_name}.order.json.gz" \
-  --data.attachments "${script_dir}/out/data/data_import/${dataset_name}.attachments.gz" \
   --num 1 \
   --max-workers 4 \
   --test-sample-limit 5)

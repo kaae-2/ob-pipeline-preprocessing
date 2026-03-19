@@ -4,7 +4,9 @@ set -euo pipefail
 # Run data_preprocessing.py with the requested parameters.
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
-out_dir="${script_dir}/out/data/data_import/preprocessing/data_preprocessing/default"
+stratify_dir="${repo_root}/stratify"
+stratify_out_dir="${stratify_dir}/out/data/data_import/stratify/data_stratify/default"
+out_dir="${script_dir}/out/data/data_import/stratify/data_stratify/preprocessing/data_preprocessing/default"
 dataset_name="FR-FCM-Z2KP-covid"
 
 train_matrix="${out_dir}/data_import.train.matrix.tar.gz"
@@ -19,11 +21,13 @@ rm -f "${out_dir}/data_import.test.matrices.tar.gz" \
       "${out_dir}/data_import.train.labels.tar.gz" \
       "${out_dir}/data_import.label_key.json.gz"
 
+bash "${stratify_dir}/run_data_stratify.sh" "${dataset_name}"
+
 (cd "$repo_root" && python "preprocessing/data_preprocessing.py" \
   --name "data_import" \
   --output_dir "$out_dir" \
-  --data.raw "${script_dir}/out/data/data_import/${dataset_name}.data.tar.gz" \
-  --data.order "${script_dir}/out/data/data_import/${dataset_name}.order.json.gz" \
+  --data.raw "${stratify_out_dir}/data_stratify.data.tar.gz" \
+  --data.order "${stratify_out_dir}/data_stratify.order.json.gz" \
   --num 1 \
   --max-workers 4 \
   --test-sample-limit 5)

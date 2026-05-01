@@ -5,6 +5,7 @@
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import os
 import sys
@@ -35,6 +36,7 @@ LABEL_COLUMN_CANDIDATES = (
 )
 UNLABELED_VALUES = {'', 'unlabeled', 'ungated', 'debris', 'unknown', 'other', 'noise'}
 TAR_GZIP_COMPRESSLEVEL = 1
+PREPROCESS_CACHE_ROOT = Path(__file__).resolve().parents[1] / '.cache' / 'preprocessing'
 
 
 def read_bytes_handling_gzip(path: str) -> bytes:
@@ -165,6 +167,51 @@ def _load_csv_sample(
     return sample_id, features, labels
 
 
+def _archive_cache_dir(raw_path: Path) -> Path:
+    stat = raw_path.stat()
+    key_material = f'{raw_path.resolve()}::{stat.st_size}::{stat.st_mtime_ns}'
+    digest = hashlib.sha256(key_material.encode('utf-8')).hexdigest()
+    return PREPROCESS_CACHE_ROOT / digest
+
+
+def _sample_cache_paths(
+    cache_dir: Path, sample_id: int, csv_path: Path, label_col: Optional[str]
+) -> tuple[Path, Path]:
+    label_key = (label_col or 'auto').strip().lower() or 'auto'
+    sample_key = hashlib.sha256(
+        f'{sample_id}:{csv_path.name}:{label_key}'.encode('utf-8')
+    ).hexdigest()[:16]
+    return (
+        cache_dir / f'{sample_key}.features.pkl.gz',
+        cache_dir / f'{sample_key}.labels.pkl.gz',
+    )
+
+
+def _load_cached_csv_sample(
+    sample_id: int,
+    csv_path: Path,
+    label_col: Optional[str],
+    cache_dir: Path,
+) -> Tuple[int, pd.DataFrame, pd.Series]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    features_cache, labels_cache = _sample_cache_paths(
+        cache_dir, sample_id, csv_path, label_col
+    )
+    if features_cache.exists() and labels_cache.exists():
+        features = pd.read_pickle(features_cache, compression='gzip')
+        labels = pd.read_pickle(labels_cache, compression='gzip')
+        return sample_id, features, labels
+
+    _, features, labels = _load_csv_sample(sample_id, csv_path, label_col)
+    tmp_features = features_cache.with_name(f'{features_cache.name}.tmp')
+    tmp_labels = labels_cache.with_name(f'{labels_cache.name}.tmp')
+    features.to_pickle(tmp_features, compression='gzip')
+    labels.to_pickle(tmp_labels, compression='gzip')
+    tmp_features.replace(features_cache)
+    tmp_labels.replace(labels_cache)
+    return sample_id, features, labels
+
+
 def _collect_sample_label_values(
     sample_id: int, csv_path: Path, preferred_label_col: Optional[str]
 ) -> Tuple[int, set[str]]:
@@ -251,6 +298,7 @@ def _write_sample_archives_from_paths(
     id_to_label: Dict[int, str],
     preferred_label_col: Optional[str],
     sub_sampling: int,
+    cache_dir: Path,
 ) -> None:
     train_matrix_path = out_dir / f'{name}.train.matrix.tar.gz'
     train_labels_path = out_dir / f'{name}.train.labels.tar.gz'
@@ -258,8 +306,8 @@ def _write_sample_archives_from_paths(
     test_labels_path = out_dir / f'{name}.test.labels.tar.gz'
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        _, train_features, train_labels = _load_csv_sample(
-            train_id, sample_paths[train_id], preferred_label_col
+        _, train_features, train_labels = _load_cached_csv_sample(
+            train_id, sample_paths[train_id], preferred_label_col, cache_dir
         )
         train_labels = _normalize_label_series(train_labels)
         if sub_sampling > 0:
@@ -286,8 +334,8 @@ def _write_sample_archives_from_paths(
         test_matrix_files: List[Path] = []
         test_label_files: List[Path] = []
         for test_id in test_ids:
-            _, test_features, test_labels = _load_csv_sample(
-                test_id, sample_paths[test_id], preferred_label_col
+            _, test_features, test_labels = _load_cached_csv_sample(
+                test_id, sample_paths[test_id], preferred_label_col, cache_dir
             )
             test_labels = _normalize_label_series(test_labels)
             mapped_test_labels = map_labels_to_ints(test_labels, id_to_label)
@@ -468,6 +516,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         sub_sampling = 0
 
     tmp_dir, csv_paths = extract_csv_from_tar(raw_path)
+    cache_dir = _archive_cache_dir(raw_path)
     try:
         if not csv_paths:
             raise FileNotFoundError(f'No CSV inputs found at {raw_path}')
@@ -542,6 +591,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             id_to_label=id_to_label,
             preferred_label_col=label_col,
             sub_sampling=sub_sampling,
+            cache_dir=cache_dir,
         )
         _write_label_key(out_dir, name, id_to_label, dataset_name=dataset_name)
     finally:

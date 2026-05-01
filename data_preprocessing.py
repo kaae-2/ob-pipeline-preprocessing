@@ -490,8 +490,14 @@ def parse_args() -> argparse.ArgumentParser:
     parser.add_argument(
         '--data.metadata',
         type=str,
-        required=True,
+        required=False,
         help="Path to metadata JSON.gz containing samples.order and dataset context.",
+    )
+    parser.add_argument(
+        '--data.import_metadata',
+        type=str,
+        required=False,
+        help='Alias for benchmark-wired import metadata input.',
     )
     parser.add_argument(
         '--num',
@@ -511,7 +517,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     raw_path = Path(getattr(args, 'data.raw'))
-    metadata_path = getattr(args, 'data.metadata')
+    metadata_path = getattr(args, 'data.metadata') or getattr(
+        args, 'data.import_metadata'
+    )
+    if metadata_path is None:
+        raise SystemExit('Either --data.metadata or --data.import_metadata is required.')
     output_dir = args.output_dir
     name = args.name
     num = args.num

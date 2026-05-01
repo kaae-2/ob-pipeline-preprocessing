@@ -39,6 +39,41 @@ TAR_GZIP_COMPRESSLEVEL = 1
 PREPROCESS_CACHE_ROOT = Path(__file__).resolve().parents[1] / '.cache' / 'preprocessing'
 
 
+def _copy_json_object(value):
+    return json.loads(json.dumps(value))
+
+
+def _populate_metadata_legacy_aliases(payload: Dict[str, object]) -> Dict[str, object]:
+    dataset = payload.get('dataset')
+    samples = payload.get('samples')
+    labels = payload.get('labels')
+    stages = payload.get('stages')
+
+    legacy_metadata: Dict[str, object] = {}
+    if isinstance(dataset, dict):
+        legacy_metadata.update(_copy_json_object(dataset))
+    if isinstance(samples, dict):
+        for key in ('sample_names', 'cells_per_sample', 'sample_count'):
+            if key in samples:
+                legacy_metadata[key] = _copy_json_object(samples[key])
+    if isinstance(stages, dict):
+        stratify = stages.get('stratify')
+        if isinstance(stratify, dict) and 'stratification' in stratify:
+            legacy_metadata['stratification'] = _copy_json_object(
+                stratify['stratification']
+            )
+
+    payload['metadata'] = legacy_metadata
+    if isinstance(samples, dict) and 'order' in samples:
+        payload['order'] = _copy_json_object(samples['order'])
+    if isinstance(labels, dict):
+        if 'id_to_label' in labels:
+            payload['id_to_label'] = _copy_json_object(labels['id_to_label'])
+        if 'label_to_id' in labels:
+            payload['label_to_id'] = _copy_json_object(labels['label_to_id'])
+    return payload
+
+
 def read_bytes_handling_gzip(path: str) -> bytes:
     try:
         with gzip.open(path, 'rb') as fh:
@@ -271,22 +306,11 @@ def write_series_csv(series: pd.Series, path: Path, header: bool = False) -> Non
     series.to_csv(path, index=False, header=header)
 
 
-def _write_label_key(
-    out_dir: Path,
-    name: str,
-    id_to_label: Dict[int, str],
-    dataset_name: Optional[str] = None,
-) -> None:
+def _write_metadata(out_dir: Path, name: str, payload: Dict[str, object]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    payload = {'id_to_label': {str(k): v for k, v in id_to_label.items()}}
-    metadata: Dict[str, str] = {}
-    if dataset_name is not None and dataset_name.strip():
-        metadata['dataset_name'] = dataset_name.strip()
-    if metadata:
-        payload['metadata'] = metadata
-    key_path = out_dir / f'{name}.label_key.json.gz'
-    with gzip.open(key_path, 'wt') as handle:
-        json.dump(payload, handle, indent=2)
+    metadata_path = out_dir / f'{name}.metadata.json.gz'
+    with gzip.open(metadata_path, 'wt') as handle:
+        json.dump(_populate_metadata_legacy_aliases(payload), handle, indent=2)
 
 
 def _write_sample_archives_from_paths(
@@ -360,21 +384,36 @@ def _write_sample_archives_from_paths(
                 tar.add(path, arcname=path.name)
 
 
-def load_order_payload(order_path: str) -> Dict[str, object]:
+def load_metadata_payload(metadata_path: str) -> Dict[str, object]:
     try:
-        payload = json.loads(read_bytes_handling_gzip(order_path).decode('utf-8'))
+        payload = json.loads(read_bytes_handling_gzip(metadata_path).decode('utf-8'))
     except json.JSONDecodeError as exc:
-        raise ValueError(f'Failed to parse order JSON: {order_path}') from exc
-    if not isinstance(payload, dict) or 'order' not in payload:
-        raise ValueError("Order JSON must be an object with an 'order' key.")
-    order = payload.get('order')
+        raise ValueError(f'Failed to parse metadata JSON: {metadata_path}') from exc
+    if not isinstance(payload, dict):
+        raise ValueError('Metadata JSON must be an object.')
+
+    dataset = payload.get('dataset')
+    if not isinstance(dataset, dict):
+        legacy_metadata = payload.get('metadata')
+        dataset = dict(legacy_metadata) if isinstance(legacy_metadata, dict) else {}
+        payload['dataset'] = dataset
+
+    samples = payload.get('samples')
+    if not isinstance(samples, dict):
+        samples = {}
+        payload['samples'] = samples
+
+    order = samples.get('order')
+    if order is None:
+        order = payload.get('order')
     if not isinstance(order, list) or not order:
-        raise ValueError('Order JSON must contain a non-empty list.')
+        raise ValueError("Metadata JSON must contain a non-empty 'samples.order' list.")
     if not all(isinstance(item, int) for item in order):
-        raise ValueError('Order entries must be integers.')
+        raise ValueError('Metadata order entries must be integers.')
     if len(set(order)) != len(order):
-        raise ValueError('Order entries must be unique.')
-    return payload
+        raise ValueError('Metadata order entries must be unique.')
+    samples['order'] = order
+    return _populate_metadata_legacy_aliases(payload)
 
 
 def _normalize_label_series(labels: pd.Series) -> pd.Series:
@@ -449,16 +488,16 @@ def parse_args() -> argparse.ArgumentParser:
         help='Path to imported tar.gz archive containing CSV/CSV.GZ samples.',
     )
     parser.add_argument(
-        '--data.order',
+        '--data.metadata',
         type=str,
         required=True,
-        help="Path to JSON file containing an 'order' list of 1-based sample indices.",
+        help="Path to metadata JSON.gz containing samples.order and dataset context.",
     )
     parser.add_argument(
         '--num',
         type=int,
         required=True,
-        help='1-based index into data.order for the training sample.',
+        help='1-based index into samples.order for the training sample.',
     )
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--name', type=str, default='dataset')
@@ -472,10 +511,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     raw_path = Path(getattr(args, 'data.raw'))
-    order_path = getattr(args, 'data.order')
+    metadata_path = getattr(args, 'data.metadata')
     output_dir = args.output_dir
     name = args.name
     num = args.num
+    requested_num = num
     test_sample_limit = args.test_sample_limit
     max_workers_arg = args.max_workers
 
@@ -487,18 +527,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    order_payload = load_order_payload(order_path)
-    order = order_payload['order']
-    metadata = order_payload.get('metadata')
-    if not isinstance(metadata, dict):
-        metadata = {}
+    metadata_payload = load_metadata_payload(metadata_path)
+    dataset_section = metadata_payload.get('dataset')
+    if not isinstance(dataset_section, dict):
+        dataset_section = {}
+    samples_section = metadata_payload.get('samples')
+    if not isinstance(samples_section, dict):
+        samples_section = {}
+    order = samples_section['order']
 
-    dataset_name_raw = metadata.get('dataset_name')
+    dataset_name_raw = dataset_section.get('dataset_name')
     dataset_name: Optional[str] = None
     if isinstance(dataset_name_raw, str) and dataset_name_raw.strip():
         dataset_name = dataset_name_raw.strip()
 
-    sub_sampling_raw = metadata.get('sub_sampling', 0)
+    sub_sampling_raw = dataset_section.get('sub_sampling', 0)
     try:
         if isinstance(sub_sampling_raw, bool):
             sub_sampling = int(sub_sampling_raw)
@@ -593,7 +636,34 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             sub_sampling=sub_sampling,
             cache_dir=cache_dir,
         )
-        _write_label_key(out_dir, name, id_to_label, dataset_name=dataset_name)
+        output_metadata = _copy_json_object(metadata_payload)
+        output_dataset = output_metadata.setdefault('dataset', {})
+        output_samples = output_metadata.setdefault('samples', {})
+        output_labels = output_metadata.setdefault('labels', {})
+        output_stages = output_metadata.setdefault('stages', {})
+
+        if dataset_name is not None:
+            output_dataset['dataset_name'] = dataset_name
+
+        id_to_label_json = {str(k): v for k, v in sorted(id_to_label.items())}
+        label_to_id_json = {value: int(key) for key, value in id_to_label_json.items()}
+        output_labels['id_to_label'] = id_to_label_json
+        output_labels['label_to_id'] = label_to_id_json
+        output_labels['non_target_aliases'] = sorted(UNLABELED_VALUES)
+        output_samples['order'] = order
+
+        output_stages['preprocessing'] = {
+            'requested_num': int(requested_num),
+            'resolved_num': int(num),
+            'train_sample_id': int(train_id),
+            'test_sample_ids': [int(item) for item in test_ids],
+            'train_sample_name': sample_paths[train_id].name,
+            'test_sample_names': [sample_paths[item].name for item in test_ids],
+            'sub_sampling': int(sub_sampling),
+            'test_sample_limit': None if test_sample_limit is None else int(test_sample_limit),
+            'max_workers': int(max_workers),
+        }
+        _write_metadata(out_dir, name, output_metadata)
     finally:
         tmp_dir.cleanup()
 

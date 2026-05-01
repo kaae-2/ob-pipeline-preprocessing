@@ -12,7 +12,7 @@ splits.
   - `*.train.labels.tar.gz`
   - `*.test.matrices.tar.gz`
   - `*.test.labels.tar.gz`
-  - `*.label_key.json.gz`
+  - `*.metadata.json.gz`
 
 Label handling maps canonical non-target labels (`""`, `unlabeled`, `ungated`,
 `debris`, `unknown`, `other`, `noise`) to label id `0`.
@@ -26,7 +26,7 @@ bash preprocessing/run_data_preprocessing.sh
 Or direct CLI:
 
 ```bash
-python preprocessing/data_preprocessing.py --name data_import --output_dir preprocessing/out/... --data.raw <dataset>.data.tar.gz --data.order <dataset>.order.json.gz --num 1
+python preprocessing/data_preprocessing.py --name data_import --output_dir preprocessing/out/... --data.raw <dataset>.data.tar.gz --data.metadata <dataset>.metadata.json.gz --num 1
 ```
 
 ## Run as part of benchmark

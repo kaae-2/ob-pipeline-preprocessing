@@ -11,19 +11,19 @@ train_matrix="${out_dir}/data_import.train.matrix.tar.gz"
 train_labels="${out_dir}/data_import.train.labels.tar.gz"
 test_matrices="${out_dir}/data_import.test.matrices.tar.gz"
 test_labels="${out_dir}/data_import.test.labels.tar.gz"
-label_key="${out_dir}/data_import.label_key.json.gz"
+metadata_file="${out_dir}/data_import.metadata.json.gz"
 
 rm -f "${out_dir}/data_import.test.matrices.tar.gz" \
       "${out_dir}/data_import.test.labels.tar.gz" \
       "${out_dir}/data_import.train.matrix.tar.gz" \
       "${out_dir}/data_import.train.labels.tar.gz" \
-      "${out_dir}/data_import.label_key.json.gz"
+      "${out_dir}/data_import.metadata.json.gz"
 
 (cd "$repo_root" && python "preprocessing/data_preprocessing.py" \
   --name "data_import" \
   --output_dir "$out_dir" \
   --data.raw "${script_dir}/out/data/data_import/${dataset_name}.data.tar.gz" \
-  --data.order "${script_dir}/out/data/data_import/${dataset_name}.order.json.gz" \
+  --data.metadata "${script_dir}/out/data/data_import/${dataset_name}.metadata.json.gz" \
   --num 1 \
   --max-workers 4 \
   --test-sample-limit 5)

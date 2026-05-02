@@ -11,6 +11,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -238,12 +239,17 @@ def _load_cached_csv_sample(
         return sample_id, features, labels
 
     _, features, labels = _load_csv_sample(sample_id, csv_path, label_col)
-    tmp_features = features_cache.with_name(f'{features_cache.name}.tmp')
-    tmp_labels = labels_cache.with_name(f'{labels_cache.name}.tmp')
-    features.to_pickle(tmp_features, compression='gzip')
-    labels.to_pickle(tmp_labels, compression='gzip')
-    tmp_features.replace(features_cache)
-    tmp_labels.replace(labels_cache)
+    tmp_suffix = f'.tmp.{os.getpid()}.{uuid.uuid4().hex}'
+    tmp_features = features_cache.with_name(f'{features_cache.name}{tmp_suffix}')
+    tmp_labels = labels_cache.with_name(f'{labels_cache.name}{tmp_suffix}')
+    try:
+        features.to_pickle(tmp_features, compression='gzip')
+        labels.to_pickle(tmp_labels, compression='gzip')
+        tmp_features.replace(features_cache)
+        tmp_labels.replace(labels_cache)
+    finally:
+        tmp_features.unlink(missing_ok=True)
+        tmp_labels.unlink(missing_ok=True)
     return sample_id, features, labels
 
 

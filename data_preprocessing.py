@@ -44,6 +44,18 @@ def _copy_json_object(value):
     return json.loads(json.dumps(value))
 
 
+def _is_non_target_label(value: object) -> bool:
+    if pd.isna(value):
+        return True
+    text = str(value).strip()
+    if not text or text.lower() in UNLABELED_VALUES:
+        return True
+    try:
+        return float(text) == 0.0
+    except ValueError:
+        return False
+
+
 def _populate_metadata_legacy_aliases(payload: Dict[str, object]) -> Dict[str, object]:
     dataset = payload.get('dataset')
     samples = payload.get('samples')
@@ -104,6 +116,10 @@ def extract_csv_from_tar(tar_path: Path) -> Tuple[tempfile.TemporaryDirectory, L
         if not members:
             tmp_dir.cleanup()
             raise FileNotFoundError(f'No CSV files found in archive: {tar_path}')
+        member_names = [member.name for member in members]
+        if len(set(member_names)) != len(member_names):
+            tmp_dir.cleanup()
+            raise ValueError(f'Duplicate CSV member names found in archive: {tar_path}')
         extracted: List[Path] = []
         for member in members:
             tar.extract(member, path=tmp_dir.name, filter='data')
@@ -271,9 +287,7 @@ def _collect_sample_label_values(
     labels = _read_csv_column(csv_path, label_col)
     normalized = _normalize_label_series(labels)
     values = normalized.dropna().astype(str).str.strip()
-    return sample_id, {
-        value for value in values if value and value.lower() not in UNLABELED_VALUES
-    }
+    return sample_id, {value for value in values if not _is_non_target_label(value)}
 
 
 def build_label_key_from_values(label_values: Sequence[str]) -> Dict[int, str]:
@@ -281,7 +295,7 @@ def build_label_key_from_values(label_values: Sequence[str]) -> Dict[int, str]:
         {
             value
             for value in label_values
-            if value and value.lower() not in UNLABELED_VALUES
+            if not _is_non_target_label(value)
         }
     )
     return {idx + 1: label for idx, label in enumerate(ordered)}
@@ -291,11 +305,8 @@ def map_labels_to_ints(labels: pd.Series, id_to_label: Dict[int, str]) -> pd.Ser
     label_to_id = {label: idx for idx, label in id_to_label.items()}
     mapped: List[int] = []
     for value in labels:
-        if pd.isna(value):
-            mapped.append(0)
-            continue
         text = str(value).strip()
-        if not text or text.lower() in UNLABELED_VALUES:
+        if _is_non_target_label(value):
             mapped.append(0)
             continue
         mapped.append(label_to_id.get(text, 0))
@@ -312,11 +323,27 @@ def write_series_csv(series: pd.Series, path: Path, header: bool = False) -> Non
     series.to_csv(path, index=False, header=header)
 
 
+def _write_json_gzip(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'wb') as raw_handle, gzip.GzipFile(
+        filename='', fileobj=raw_handle, mode='wb', mtime=0
+    ) as gzip_handle:
+        serialized = json.dumps(payload, indent=2, sort_keys=True) + '\n'
+        gzip_handle.write(serialized.encode('utf-8'))
+
+
 def _write_metadata(out_dir: Path, name: str, payload: Dict[str, object]) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    metadata_path = out_dir / f'{name}.metadata.json.gz'
-    with gzip.open(metadata_path, 'wt') as handle:
-        json.dump(_populate_metadata_legacy_aliases(payload), handle, indent=2)
+    _write_json_gzip(
+        out_dir / f'{name}.metadata.json.gz',
+        _populate_metadata_legacy_aliases(payload),
+    )
+
+
+def _label_counts(labels: pd.Series) -> Dict[int, int]:
+    return {
+        int(label_id): int(count)
+        for label_id, count in labels.value_counts().sort_index().items()
+    }
 
 
 def _write_sample_archives_from_paths(
@@ -329,7 +356,7 @@ def _write_sample_archives_from_paths(
     preferred_label_col: Optional[str],
     sub_sampling: int,
     cache_dir: Path,
-) -> None:
+) -> Dict[str, object]:
     train_matrix_path = out_dir / f'{name}.train.matrix.tar.gz'
     train_labels_path = out_dir / f'{name}.train.labels.tar.gz'
     test_matrices_path = out_dir / f'{name}.test.matrices.tar.gz'
@@ -340,6 +367,7 @@ def _write_sample_archives_from_paths(
             train_id, sample_paths[train_id], preferred_label_col, cache_dir
         )
         train_labels = _normalize_label_series(train_labels)
+        nominal_train_labels = map_labels_to_ints(train_labels, id_to_label)
         if sub_sampling > 0:
             train_features, train_labels = _subsample_training_data(
                 train_features, train_labels, sub_sampling
@@ -363,12 +391,14 @@ def _write_sample_archives_from_paths(
 
         test_matrix_files: List[Path] = []
         test_label_files: List[Path] = []
+        mapped_test_by_id: Dict[int, pd.Series] = {}
         for test_id in test_ids:
             _, test_features, test_labels = _load_cached_csv_sample(
                 test_id, sample_paths[test_id], preferred_label_col, cache_dir
             )
             test_labels = _normalize_label_series(test_labels)
             mapped_test_labels = map_labels_to_ints(test_labels, id_to_label)
+            mapped_test_by_id[test_id] = mapped_test_labels
 
             matrix_file = Path(tmpdir) / f'{name}-data-{test_id}.csv'
             label_file = Path(tmpdir) / f'{name}-label-{test_id}.csv'
@@ -388,6 +418,22 @@ def _write_sample_archives_from_paths(
         ) as tar:
             for path in test_label_files:
                 tar.add(path, arcname=path.name)
+
+    nominal_train_counts = _label_counts(nominal_train_labels)
+    sampled_train_counts = _label_counts(mapped_train_labels)
+    test_counts: Dict[int, int] = {}
+    for labels in mapped_test_by_id.values():
+        for label_id, count in _label_counts(labels).items():
+            test_counts[label_id] = test_counts.get(label_id, 0) + count
+    return {
+        'nominal_train_counts': nominal_train_counts,
+        'sampled_train_counts': sampled_train_counts,
+        'test_counts': test_counts,
+        'test_rows_by_id': {
+            int(sample_id): int(len(labels))
+            for sample_id, labels in mapped_test_by_id.items()
+        },
+    }
 
 
 def load_metadata_payload(metadata_path: str) -> Dict[str, object]:
@@ -425,8 +471,7 @@ def load_metadata_payload(metadata_path: str) -> Dict[str, object]:
 def _normalize_label_series(labels: pd.Series) -> pd.Series:
     normalized = labels.copy()
     stripped = normalized.astype(str).str.strip()
-    lower = stripped.str.lower()
-    mask = normalized.isna() | lower.isin(UNLABELED_VALUES)
+    mask = normalized.map(_is_non_target_label)
     normalized = stripped
     normalized.loc[mask] = 'unlabeled'
     return normalized
@@ -641,7 +686,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 label_values.update(sample_values)
 
         id_to_label = build_label_key_from_values(sorted(label_values))
-        _write_sample_archives_from_paths(
+        archive_counts = _write_sample_archives_from_paths(
             out_dir=out_dir,
             name=name,
             train_id=train_id,
@@ -679,7 +724,112 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             'test_sample_limit': None if test_sample_limit is None else int(test_sample_limit),
             'max_workers': int(max_workers),
         }
+        nominal_train_counts = archive_counts['nominal_train_counts']
+        sampled_train_counts = archive_counts['sampled_train_counts']
+        test_counts = archive_counts['test_counts']
+        test_rows_by_id = archive_counts['test_rows_by_id']
+        populations = [
+            {
+                'id': int(population_id),
+                'name': population_name,
+                'nominal_train_count': int(
+                    nominal_train_counts.get(population_id, 0)
+                ),
+                'training_support': int(
+                    sampled_train_counts.get(population_id, 0)
+                ),
+                'test_truth_count': int(test_counts.get(population_id, 0)),
+                'present_in_training': bool(
+                    sampled_train_counts.get(population_id, 0) > 0
+                ),
+            }
+            for population_id, population_name in sorted(id_to_label.items())
+        ]
+        sampled_rows = int(sum(sampled_train_counts.values()))
+        nominal_rows = int(sum(nominal_train_counts.values()))
+        total_test_rows = int(sum(test_counts.values()))
+        split_audit = {
+            'schema_version': '1.0.0',
+            'stage': 'preprocessing',
+            'identities': {
+                'dataset': {
+                    'metadata': _copy_json_object(output_dataset),
+                    'data_import': _copy_json_object(
+                        output_stages.get('data_import', {})
+                    ),
+                },
+                'preprocessing': {
+                    'name': name,
+                    'parameters': {
+                        'requested_fold': int(requested_num),
+                        'effective_fold': int(num),
+                        'sub_sampling': int(sub_sampling),
+                        'test_sample_limit': (
+                            None
+                            if test_sample_limit is None
+                            else int(test_sample_limit)
+                        ),
+                        'max_workers': int(max_workers),
+                    },
+                },
+            },
+            'split': {
+                'requested_fold': int(requested_num),
+                'effective_fold': int(num),
+                'wrapped_fold': {
+                    'status': requested_num != num,
+                    'reason': (
+                        'requested_fold_exceeds_sample_count'
+                        if requested_num != num
+                        else None
+                    ),
+                },
+                'training_sample': {
+                    'id': int(train_id),
+                    'name': sample_paths[train_id].name,
+                },
+                'test_samples': [
+                    {'id': int(item), 'name': sample_paths[item].name}
+                    for item in test_ids
+                ],
+            },
+            'counts': {
+                'training': {
+                    'nominal_rows': nominal_rows,
+                    'sampled_rows': sampled_rows,
+                    'rows_before_filtering': sampled_rows,
+                    'rows_after_filtering': sampled_rows,
+                    'eligible_rows': int(sampled_rows - sampled_train_counts.get(0, 0)),
+                },
+                'test': {
+                    'rows_before_filtering': total_test_rows,
+                    'rows_after_filtering': total_test_rows,
+                    'rows_by_sample': [
+                        {
+                            'id': int(item),
+                            'name': sample_paths[item].name,
+                            'rows_before_filtering': int(test_rows_by_id[item]),
+                            'rows_after_filtering': int(test_rows_by_id[item]),
+                        }
+                        for item in test_ids
+                    ],
+                },
+            },
+            'populations': populations,
+            'non_target': {
+                'id': 0,
+                'name': 'ungated_or_rejection',
+                'biological_population': False,
+                'nominal_train_count': int(nominal_train_counts.get(0, 0)),
+                'sampled_train_count': int(sampled_train_counts.get(0, 0)),
+                'final_train_count': int(sampled_train_counts.get(0, 0)),
+                'test_truth_count_before_filtering': int(test_counts.get(0, 0)),
+                'test_truth_count_after_filtering': int(test_counts.get(0, 0)),
+            },
+        }
+        output_metadata['split_audit'] = split_audit
         _write_metadata(out_dir, name, output_metadata)
+        _write_json_gzip(out_dir / f'{name}.split_audit.json.gz', split_audit)
     finally:
         tmp_dir.cleanup()
 
